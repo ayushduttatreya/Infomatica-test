@@ -1,404 +1,429 @@
 """
-Extract module for Line Item Aggregation Logic
-Extracts order line items from source systems
+Extract Informatica repository mappings from XML file.
+Parses Informatica PowerCenter repository XML to extract mapping definitions,
+source/target definitions, and transformation logic.
 """
 
 import logging
-from typing import Dict, List, Any, Optional
-from datetime import datetime
-import nipyapi
-from nipyapi.nifi import ProcessorConfigDTO, ProcessGroupEntity
-import yaml
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field, asdict
+import json
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class LineItemExtractor:
-    """Extracts line item data from source systems"""
-    
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initialize the extractor with configuration
-        
-        Args:
-            config_path: Path to configuration file
-        """
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        
-        self.nifi_config = self.config['nifi']
-        self.source_config = self.config['source']
-        self.canvas = None
-        
-    def connect_to_nifi(self) -> bool:
-        """
-        Establish connection to NiFi instance
-        
-        Returns:
-            bool: True if connection successful
-        """
-        try:
-            nipyapi.config.nifi_config.host = self.nifi_config['host']
-            nipyapi.config.nifi_config.port = self.nifi_config['port']
-            
-            # Test connection
-            nipyapi.canvas.get_root_pg_id()
-            logger.info(f"Successfully connected to NiFi at {self.nifi_config['host']}:{self.nifi_config['port']}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to NiFi: {str(e)}")
-            raise
-    
-    def create_process_group(self, parent_pg_id: str, group_name: str) -> ProcessGroupEntity:
-        """
-        Create a process group for line item extraction
-        
-        Args:
-            parent_pg_id: Parent process group ID
-            group_name: Name for the new process group
-            
-        Returns:
-            ProcessGroupEntity: Created process group
-        """
-        try:
-            pg = nipyapi.canvas.create_process_group(
-                parent_pg=nipyapi.canvas.get_process_group(parent_pg_id, 'id'),
-                new_pg_name=group_name,
-                location=(400.0, 400.0)
-            )
-            logger.info(f"Created process group: {group_name}")
-            return pg
-            
-        except Exception as e:
-            logger.error(f"Failed to create process group: {str(e)}")
-            raise
-    
-    def create_list_file_processor(self, pg_id: str) -> Any:
-        """
-        Create ListFile processor to monitor source directory
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.ListFile'),
-                location=(200.0, 200.0),
-                name='List Line Item Files'
-            )
-            
-            # Configure processor
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Input Directory': self.source_config['line_items']['directory'],
-                'File Filter': self.source_config['line_items']['file_pattern'],
-                'Recurse Subdirectories': 'false',
-                'Minimum File Age': '0 sec',
-                'Maximum File Age': self.source_config['line_items'].get('max_file_age', '30 days')
-            }
-            config.scheduling_period = self.source_config['line_items'].get('polling_interval', '30 sec')
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured ListFile processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create ListFile processor: {str(e)}")
-            raise
-    
-    def create_fetch_file_processor(self, pg_id: str) -> Any:
-        """
-        Create FetchFile processor to read file content
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.FetchFile'),
-                location=(200.0, 400.0),
-                name='Fetch Line Item File'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'File to Fetch': '${absolute.path}/${filename}',
-                'Completion Strategy': 'Move File',
-                'Move Destination Directory': self.source_config['line_items'].get('archive_directory', '/archive'),
-                'Move Conflict Strategy': 'Rename'
-            }
-            config.auto_terminated_relationships = ['not.found', 'permission.denied']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured FetchFile processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create FetchFile processor: {str(e)}")
-            raise
-    
-    def create_split_record_processor(self, pg_id: str) -> Any:
-        """
-        Create SplitRecord processor to split line items
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.SplitRecord'),
-                location=(200.0, 600.0),
-                name='Split Line Items'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'JsonRecordSetWriter',
-                'Records Per Split': self.source_config['line_items'].get('records_per_split', '1000')
-            }
-            config.auto_terminated_relationships = ['failure']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured SplitRecord processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create SplitRecord processor: {str(e)}")
-            raise
-    
-    def create_validate_record_processor(self, pg_id: str) -> Any:
-        """
-        Create ValidateRecord processor to validate line item schema
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.ValidateRecord'),
-                location=(200.0, 800.0),
-                name='Validate Line Items'
-            )
-            
-            validation_rules = self.source_config['line_items'].get('validation_rules', {})
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'JsonTreeReader',
-                'Record Writer': 'JsonRecordSetWriter',
-                'Schema Access Strategy': 'Use String Property',
-                'Allow Extra Fields': 'true',
-                'Max Validation Details': '100'
-            }
-            
-            # Add validation rules
-            for field, rule in validation_rules.items():
-                config.properties[f'validate.{field}'] = rule
-            
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured ValidateRecord processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create ValidateRecord processor: {str(e)}")
-            raise
-    
-    def create_route_on_attribute_processor(self, pg_id: str) -> Any:
-        """
-        Create RouteOnAttribute processor to route valid/invalid records
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.RouteOnAttribute'),
-                location=(200.0, 1000.0),
-                name='Route Valid Line Items'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Routing Strategy': 'Route to Property name',
-                'valid': "${record.error.message:isEmpty()}",
-                'invalid': "${record.error.message:isEmpty():not()}"
-            }
-            config.auto_terminated_relationships = ['unmatched']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured RouteOnAttribute processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create RouteOnAttribute processor: {str(e)}")
-            raise
-    
-    def create_extraction_flow(self, parent_pg_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Create complete extraction flow for line items
-        
-        Args:
-            parent_pg_id: Parent process group ID (uses root if None)
-            
-        Returns:
-            Dict containing created processors and connections
-        """
-        try:
-            if parent_pg_id is None:
-                parent_pg_id = nipyapi.canvas.get_root_pg_id()
-            
-            # Create process group
-            pg = self.create_process_group(parent_pg_id, 'Line_Item_Extraction')
-            pg_id = pg.id
-            
-            # Create processors
-            list_file = self.create_list_file_processor(pg_id)
-            fetch_file = self.create_fetch_file_processor(pg_id)
-            split_record = self.create_split_record_processor(pg_id)
-            validate_record = self.create_validate_record_processor(pg_id)
-            route_attribute = self.create_route_on_attribute_processor(pg_id)
-            
-            # Create connections
-            connections = []
-            
-            # ListFile -> FetchFile
-            conn1 = nipyapi.canvas.create_connection(
-                source=list_file,
-                target=fetch_file,
-                relationships=['success']
-            )
-            connections.append(conn1)
-            
-            # FetchFile -> SplitRecord
-            conn2 = nipyapi.canvas.create_connection(
-                source=fetch_file,
-                target=split_record,
-                relationships=['success']
-            )
-            connections.append(conn2)
-            
-            # SplitRecord -> ValidateRecord
-            conn3 = nipyapi.canvas.create_connection(
-                source=split_record,
-                target=validate_record,
-                relationships=['splits']
-            )
-            connections.append(conn3)
-            
-            # ValidateRecord -> RouteOnAttribute
-            conn4 = nipyapi.canvas.create_connection(
-                source=validate_record,
-                target=route_attribute,
-                relationships=['valid', 'invalid']
-            )
-            connections.append(conn4)
-            
-            logger.info("Successfully created extraction flow")
-            
-            return {
-                'process_group': pg,
-                'processors': {
-                    'list_file': list_file,
-                    'fetch_file': fetch_file,
-                    'split_record': split_record,
-                    'validate_record': validate_record,
-                    'route_attribute': route_attribute
-                },
-                'connections': connections
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to create extraction flow: {str(e)}")
-            raise
-    
-    def start_extraction_flow(self, pg_id: str) -> bool:
-        """
-        Start all processors in the extraction flow
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
-            nipyapi.canvas.schedule_process_group(pg.id, True)
-            logger.info(f"Started extraction flow in process group: {pg_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to start extraction flow: {str(e)}")
-            raise
-    
-    def stop_extraction_flow(self, pg_id: str) -> bool:
-        """
-        Stop all processors in the extraction flow
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
-            nipyapi.canvas.schedule_process_group(pg.id, False)
-            logger.info(f"Stopped extraction flow in process group: {pg_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to stop extraction flow: {str(e)}")
-            raise
+@dataclass
+class SourceField:
+    """Represents a source field definition."""
+    name: str
+    datatype: str
+    length: int
+    nullable: str
+    precision: int
+    scale: int
+    field_number: int
+    key_type: str = "NOT A KEY"
+    description: str = ""
+    business_name: str = ""
 
 
-def main():
-    """Main execution function"""
-    try:
-        extractor = LineItemExtractor()
-        extractor.connect_to_nifi()
+@dataclass
+class SourceDefinition:
+    """Represents a source definition."""
+    name: str
+    database_type: str
+    description: str
+    fields: List[SourceField] = field(default_factory=list)
+    object_version: str = "1"
+    version_number: str = "1"
+
+
+@dataclass
+class TargetField:
+    """Represents a target field definition."""
+    name: str
+    datatype: str
+    length: int
+    nullable: str
+    precision: int
+    scale: int
+    field_number: int
+    key_type: str = "NOT A KEY"
+    description: str = ""
+
+
+@dataclass
+class TargetDefinition:
+    """Represents a target definition."""
+    name: str
+    database_type: str
+    description: str
+    fields: List[TargetField] = field(default_factory=list)
+    object_version: str = "1"
+
+
+@dataclass
+class TransformField:
+    """Represents a transformation field."""
+    name: str
+    datatype: str
+    precision: int
+    scale: int
+    expression: str = ""
+    description: str = ""
+    port_type: str = ""
+
+
+@dataclass
+class Transformation:
+    """Represents a transformation definition."""
+    name: str
+    type: str
+    description: str
+    fields: List[TransformField] = field(default_factory=list)
+    object_version: str = "1"
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MappingInstance:
+    """Represents a mapping instance (source/target/transformation usage)."""
+    name: str
+    type: str
+    transformation_name: str
+    transformation_type: str
+
+
+@dataclass
+class MappingConnector:
+    """Represents a connector between transformations."""
+    from_instance: str
+    from_field: str
+    to_instance: str
+    to_field: str
+
+
+@dataclass
+class Mapping:
+    """Represents a complete mapping definition."""
+    name: str
+    description: str
+    is_valid: str
+    instances: List[MappingInstance] = field(default_factory=list)
+    connectors: List[MappingConnector] = field(default_factory=list)
+    object_version: str = "1"
+
+
+@dataclass
+class Folder:
+    """Represents a repository folder."""
+    name: str
+    owner: str
+    description: str
+    sources: List[SourceDefinition] = field(default_factory=list)
+    targets: List[TargetDefinition] = field(default_factory=list)
+    transformations: List[Transformation] = field(default_factory=list)
+    mappings: List[Mapping] = field(default_factory=list)
+    version: str = "1"
+
+
+@dataclass
+class Repository:
+    """Represents the complete Informatica repository."""
+    name: str
+    version: str
+    codepage: str
+    database_type: str
+    folders: List[Folder] = field(default_factory=list)
+    creation_date: str = ""
+    repository_version: str = ""
+
+
+class InformaticaXMLParser:
+    """Parser for Informatica PowerCenter repository XML files."""
+
+    def __init__(self, xml_path: str):
+        """
+        Initialize the parser.
         
-        # Create extraction flow
-        flow = extractor.create_extraction_flow()
+        Args:
+            xml_path: Path to the Informatica repository XML file
+        """
+        self.xml_path = Path(xml_path)
+        self.tree: Optional[ET.ElementTree] = None
+        self.root: Optional[ET.Element] = None
+
+    def parse(self) -> Repository:
+        """
+        Parse the XML file and extract repository structure.
         
-        logger.info("Line item extraction flow created successfully")
-        logger.info(f"Process Group ID: {flow['process_group'].id}")
+        Returns:
+            Repository object containing all parsed definitions
+            
+        Raises:
+            FileNotFoundError: If XML file does not exist
+            ET.ParseError: If XML is malformed
+        """
+        logger.info(f"Parsing Informatica repository XML: {self.xml_path}")
         
-    except Exception as e:
-        logger.error(f"Failed to create extraction flow: {str(e)}")
-        raise
+        if not self.xml_path.exists():
+            raise FileNotFoundError(f"XML file not found: {self.xml_path}")
+        
+        try:
+            self.tree = ET.parse(self.xml_path)
+            self.root = self.tree.getroot()
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse XML: {e}")
+            raise
+        
+        if self.root.tag != "POWERMART":
+            raise ValueError(f"Invalid root element: {self.root.tag}, expected POWERMART")
+        
+        repository = self._parse_repository()
+        logger.info(f"Successfully parsed repository: {repository.name}")
+        logger.info(f"Found {len(repository.folders)} folders")
+        
+        return repository
+
+    def _parse_repository(self) -> Repository:
+        """Parse the REPOSITORY element."""
+        repo_elem = self.root.find("REPOSITORY")
+        if repo_elem is None:
+            raise ValueError("No REPOSITORY element found in XML")
+        
+        repository = Repository(
+            name=repo_elem.get("NAME", ""),
+            version=repo_elem.get("VERSION", ""),
+            codepage=repo_elem.get("CODEPAGE", "UTF-8"),
+            database_type=repo_elem.get("DATABASETYPE", ""),
+            creation_date=self.root.get("CREATION_DATE", ""),
+            repository_version=self.root.get("REPOSITORY_VERSION", "")
+        )
+        
+        for folder_elem in repo_elem.findall("FOLDER"):
+            folder = self._parse_folder(folder_elem)
+            repository.folders.append(folder)
+        
+        return repository
+
+    def _parse_folder(self, folder_elem: ET.Element) -> Folder:
+        """Parse a FOLDER element."""
+        folder = Folder(
+            name=folder_elem.get("NAME", ""),
+            owner=folder_elem.get("OWNER", ""),
+            description=folder_elem.get("DESCRIPTION", ""),
+            version=folder_elem.get("VERSION", "1")
+        )
+        
+        logger.info(f"Parsing folder: {folder.name}")
+        
+        # Parse sources
+        for source_elem in folder_elem.findall("SOURCE"):
+            source = self._parse_source(source_elem)
+            folder.sources.append(source)
+        
+        # Parse targets
+        for target_elem in folder_elem.findall("TARGET"):
+            target = self._parse_target(target_elem)
+            folder.targets.append(target)
+        
+        # Parse transformations
+        for transform_elem in folder_elem.findall("TRANSFORMATION"):
+            transformation = self._parse_transformation(transform_elem)
+            folder.transformations.append(transformation)
+        
+        # Parse mappings
+        for mapping_elem in folder_elem.findall("MAPPING"):
+            mapping = self._parse_mapping(mapping_elem)
+            folder.mappings.append(mapping)
+        
+        logger.info(f"Folder {folder.name}: {len(folder.sources)} sources, "
+                   f"{len(folder.targets)} targets, "
+                   f"{len(folder.transformations)} transformations, "
+                   f"{len(folder.mappings)} mappings")
+        
+        return folder
+
+    def _parse_source(self, source_elem: ET.Element) -> SourceDefinition:
+        """Parse a SOURCE element."""
+        source = SourceDefinition(
+            name=source_elem.get("NAME", ""),
+            database_type=source_elem.get("DATABASETYPE", ""),
+            description=source_elem.get("DESCRIPTION", ""),
+            object_version=source_elem.get("OBJECTVERSION", "1"),
+            version_number=source_elem.get("VERSIONNUMBER", "1")
+        )
+        
+        for field_elem in source_elem.findall("SOURCEFIELD"):
+            field = SourceField(
+                name=field_elem.get("NAME", ""),
+                datatype=field_elem.get("DATATYPE", "string"),
+                length=int(field_elem.get("LENGTH", "0")),
+                nullable=field_elem.get("NULLABLE", "NULL"),
+                precision=int(field_elem.get("PRECISION", "0")),
+                scale=int(field_elem.get("SCALE", "0")),
+                field_number=int(field_elem.get("FIELDNUMBER", "0")),
+                key_type=field_elem.get("KEYTYPE", "NOT A KEY"),
+                description=field_elem.get("DESCRIPTION", ""),
+                business_name=field_elem.get("BUSINESSNAME", "")
+            )
+            source.fields.append(field)
+        
+        return source
+
+    def _parse_target(self, target_elem: ET.Element) -> TargetDefinition:
+        """Parse a TARGET element."""
+        target = TargetDefinition(
+            name=target_elem.get("NAME", ""),
+            database_type=target_elem.get("DATABASETYPE", ""),
+            description=target_elem.get("DESCRIPTION", ""),
+            object_version=target_elem.get("OBJECTVERSION", "1")
+        )
+        
+        for field_elem in target_elem.findall("TARGETFIELD"):
+            field = TargetField(
+                name=field_elem.get("NAME", ""),
+                datatype=field_elem.get("DATATYPE", "string"),
+                length=int(field_elem.get("LENGTH", "0")),
+                nullable=field_elem.get("NULLABLE", "NULL"),
+                precision=int(field_elem.get("PRECISION", "0")),
+                scale=int(field_elem.get("SCALE", "0")),
+                field_number=int(field_elem.get("FIELDNUMBER", "0")),
+                key_type=field_elem.get("KEYTYPE", "NOT A KEY"),
+                description=field_elem.get("DESCRIPTION", "")
+            )
+            target.fields.append(field)
+        
+        return target
+
+    def _parse_transformation(self, transform_elem: ET.Element) -> Transformation:
+        """Parse a TRANSFORMATION element."""
+        transformation = Transformation(
+            name=transform_elem.get("NAME", ""),
+            type=transform_elem.get("TYPE", ""),
+            description=transform_elem.get("DESCRIPTION", ""),
+            object_version=transform_elem.get("OBJECTVERSION", "1")
+        )
+        
+        # Parse transformation fields
+        for field_elem in transform_elem.findall("TRANSFORMFIELD"):
+            field = TransformField(
+                name=field_elem.get("NAME", ""),
+                datatype=field_elem.get("DATATYPE", "string"),
+                precision=int(field_elem.get("PRECISION", "0")),
+                scale=int(field_elem.get("SCALE", "0")),
+                expression=field_elem.get("EXPRESSION", ""),
+                description=field_elem.get("DESCRIPTION", ""),
+                port_type=field_elem.get("PORTTYPE", "")
+            )
+            transformation.fields.append(field)
+        
+        # Parse table attributes (properties)
+        for attr_elem in transform_elem.findall("TABLEATTRIBUTE"):
+            attr_name = attr_elem.get("NAME", "")
+            attr_value = attr_elem.get("VALUE", "")
+            if attr_name:
+                transformation.properties[attr_name] = attr_value
+        
+        return transformation
+
+    def _parse_mapping(self, mapping_elem: ET.Element) -> Mapping:
+        """Parse a MAPPING element."""
+        mapping = Mapping(
+            name=mapping_elem.get("NAME", ""),
+            description=mapping_elem.get("DESCRIPTION", ""),
+            is_valid=mapping_elem.get("ISVALID", "YES"),
+            object_version=mapping_elem.get("OBJECTVERSION", "1")
+        )
+        
+        # Parse instances
+        for instance_elem in mapping_elem.findall("INSTANCE"):
+            instance = MappingInstance(
+                name=instance_elem.get("NAME", ""),
+                type=instance_elem.get("TYPE", ""),
+                transformation_name=instance_elem.get("TRANSFORMATION_NAME", ""),
+                transformation_type=instance_elem.get("TRANSFORMATION_TYPE", "")
+            )
+            mapping.instances.append(instance)
+        
+        # Parse connectors
+        for connector_elem in mapping_elem.findall("CONNECTOR"):
+            connector = MappingConnector(
+                from_instance=connector_elem.get("FROMINSTANCE", ""),
+                from_field=connector_elem.get("FROMFIELD", ""),
+                to_instance=connector_elem.get("TOINSTANCE", ""),
+                to_field=connector_elem.get("TOFIELD", "")
+            )
+            mapping.connectors.append(connector)
+        
+        return mapping
+
+    def export_to_json(self, repository: Repository, output_path: str) -> None:
+        """
+        Export parsed repository to JSON format.
+        
+        Args:
+            repository: Parsed repository object
+            output_path: Path to output JSON file
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Convert dataclasses to dict
+        repo_dict = self._to_dict(repository)
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(repo_dict, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Exported repository to JSON: {output_file}")
+
+    def _to_dict(self, obj: Any) -> Any:
+        """Recursively convert dataclass objects to dictionaries."""
+        if hasattr(obj, '__dataclass_fields__'):
+            result = {}
+            for field_name, field_value in asdict(obj).items():
+                result[field_name] = self._to_dict(field_value)
+            return result
+        elif isinstance(obj, list):
+            return [self._to_dict(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: self._to_dict(value) for key, value in obj.items()}
+        else:
+            return obj
+
+
+def extract_informatica_repository(xml_path: str, output_json_path: Optional[str] = None) -> Repository:
+    """
+    Main extraction function to parse Informatica repository XML.
+    
+    Args:
+        xml_path: Path to Informatica repository XML file
+        output_json_path: Optional path to export JSON output
+        
+    Returns:
+        Parsed Repository object
+    """
+    parser = InformaticaXMLParser(xml_path)
+    repository = parser.parse()
+    
+    if output_json_path:
+        parser.export_to_json(repository, output_json_path)
+    
+    return repository
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Example usage
+    repo = extract_informatica_repository(
+        "mappings/informatica_repository.xml",
+        "output/repository_parsed.json"
+    )
+    print(f"Parsed repository: {repo.name}")
+    print(f"Total folders: {len(repo.folders)}")
