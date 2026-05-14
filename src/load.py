@@ -1,334 +1,200 @@
 """
-Load module for customer transaction loading pipeline.
-Handles data loading to target systems with batch processing and error handling.
+Load module for Customer and Sales Order data to target systems.
+Handles data loading with error handling and transaction management.
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-import pandas as pd
-from pathlib import Path
+from typing import Dict, List, Any, Optional
+import csv
 import json
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class DataLoader:
-    """Loads transformed data to target systems with performance optimization."""
+    """Loads transformed data to target systems."""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the data loader.
+        Initialize the DataLoader.
         
         Args:
             config: Configuration dictionary containing target settings
         """
         self.config = config
-        self.target_config = config.get('target', {})
-        self.batch_size = config.get('processing', {}).get('batch_size', 10000)
-        self.performance_config = config.get('performance', {})
+        self.target_config = config.get('targets', {})
         
-    def load_customers(self, df: pd.DataFrame, target_path: str) -> Dict:
+    def load_customers(self, customers: List[Dict[str, Any]], target_path: str) -> int:
         """
-        Load customer data to target with batch processing.
+        Load customer data to target system.
         
         Args:
-            df: Transformed customer DataFrame
-            target_path: Path to target location
+            customers: List of transformed customer records
+            target_path: Path to target file or database
             
         Returns:
-            Dictionary containing load statistics
+            Number of records successfully loaded
         """
+        logger.info(f"Loading {len(customers)} customer records to {target_path}")
+        
         try:
-            logger.info(f"Loading {len(df)} customer records to {target_path}")
-            
-            start_time = datetime.now()
-            
-            # Create target directory if it doesn't exist
+            loaded_count = 0
             Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             
-            # Split into batches for performance
-            batches = self._split_into_batches(df, self.batch_size)
-            
-            load_stats = {
-                'total_records': len(df),
-                'batches_processed': 0,
-                'records_loaded': 0,
-                'records_failed': 0,
-                'start_time': start_time.isoformat(),
-                'errors': []
-            }
-            
-            # Process each batch
-            for batch_num, batch_df in enumerate(batches, 1):
-                try:
-                    batch_file = f"{target_path}_batch_{batch_num}.parquet"
+            with open(target_path, 'w', newline='', encoding='utf-8') as f:
+                if customers:
+                    fieldnames = customers[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
                     
-                    # Write batch to parquet for performance
-                    batch_df.to_parquet(
-                        batch_file,
-                        engine='pyarrow',
-                        compression='snappy',
-                        index=False
-                    )
-                    
-                    load_stats['batches_processed'] += 1
-                    load_stats['records_loaded'] += len(batch_df)
-                    
-                    logger.info(f"Loaded batch {batch_num} with {len(batch_df)} records")
-                    
-                except Exception as e:
-                    error_msg = f"Error loading batch {batch_num}: {str(e)}"
-                    logger.error(error_msg)
-                    load_stats['errors'].append(error_msg)
-                    load_stats['records_failed'] += len(batch_df)
-            
-            # Write consolidated file
-            df.to_parquet(
-                f"{target_path}_consolidated.parquet",
-                engine='pyarrow',
-                compression='snappy',
-                index=False
-            )
-            
-            # Write CSV for compatibility
-            df.to_csv(
-                f"{target_path}_consolidated.csv",
-                index=False,
-                encoding='utf-8'
-            )
-            
-            end_time = datetime.now()
-            load_stats['end_time'] = end_time.isoformat()
-            load_stats['duration_seconds'] = (end_time - start_time).total_seconds()
-            load_stats['records_per_second'] = (
-                load_stats['records_loaded'] / load_stats['duration_seconds']
-                if load_stats['duration_seconds'] > 0 else 0
-            )
-            
-            # Write load statistics
-            self._write_load_stats(load_stats, f"{target_path}_load_stats.json")
-            
-            logger.info(f"Customer load completed: {load_stats}")
-            return load_stats
+                    for customer in customers:
+                        try:
+                            writer.writerow(customer)
+                            loaded_count += 1
+                        except Exception as e:
+                            logger.error(f"Error loading customer {customer.get('customer_id')}: {str(e)}")
+                            
+            logger.info(f"Successfully loaded {loaded_count} customer records")
+            return loaded_count
             
         except Exception as e:
             logger.error(f"Error loading customer data: {str(e)}")
             raise
-    
-    def load_transactions(self, df: pd.DataFrame, target_path: str) -> Dict:
+            
+    def load_customer_addresses(self, addresses: List[Dict[str, Any]], target_path: str) -> int:
         """
-        Load transaction data to target with optimized batch processing.
+        Load customer address data to target system.
         
         Args:
-            df: Transformed transaction DataFrame
-            target_path: Path to target location
+            addresses: List of transformed address records
+            target_path: Path to target file or database
             
         Returns:
-            Dictionary containing load statistics
+            Number of records successfully loaded
         """
+        logger.info(f"Loading {len(addresses)} address records to {target_path}")
+        
         try:
-            logger.info(f"Loading {len(df)} transaction records to {target_path}")
-            
-            start_time = datetime.now()
-            
-            # Create target directory
+            loaded_count = 0
             Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             
-            # Partition by date for performance
-            if 'transaction_date' in df.columns:
-                df['partition_year'] = df['transaction_date'].dt.year
-                df['partition_month'] = df['transaction_date'].dt.month
+            with open(target_path, 'w', newline='', encoding='utf-8') as f:
+                if addresses:
+                    fieldnames = addresses[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    
+                    for address in addresses:
+                        try:
+                            writer.writerow(address)
+                            loaded_count += 1
+                        except Exception as e:
+                            logger.error(f"Error loading address {address.get('address_id')}: {str(e)}")
+                            
+            logger.info(f"Successfully loaded {loaded_count} address records")
+            return loaded_count
             
-            load_stats = {
-                'total_records': len(df),
-                'partitions_processed': 0,
-                'records_loaded': 0,
-                'records_failed': 0,
-                'start_time': start_time.isoformat(),
-                'errors': []
-            }
+        except Exception as e:
+            logger.error(f"Error loading address data: {str(e)}")
+            raise
             
-            # Write partitioned data
-            if 'partition_year' in df.columns:
-                for (year, month), group in df.groupby(['partition_year', 'partition_month']):
-                    try:
-                        partition_path = f"{target_path}/year={year}/month={month:02d}"
-                        Path(partition_path).mkdir(parents=True, exist_ok=True)
-                        
-                        # Write partition
-                        group.to_parquet(
-                            f"{partition_path}/data.parquet",
-                            engine='pyarrow',
-                            compression='snappy',
-                            index=False
-                        )
-                        
-                        load_stats['partitions_processed'] += 1
-                        load_stats['records_loaded'] += len(group)
-                        
-                        logger.info(f"Loaded partition {year}-{month:02d} with {len(group)} records")
-                        
-                    except Exception as e:
-                        error_msg = f"Error loading partition {year}-{month}: {str(e)}"
-                        logger.error(error_msg)
-                        load_stats['errors'].append(error_msg)
-                        load_stats['records_failed'] += len(group)
-            else:
-                # Fall back to batch processing
-                batches = self._split_into_batches(df, self.batch_size)
-                
-                for batch_num, batch_df in enumerate(batches, 1):
-                    try:
-                        batch_file = f"{target_path}_batch_{batch_num}.parquet"
-                        
-                        batch_df.to_parquet(
-                            batch_file,
-                            engine='pyarrow',
-                            compression='snappy',
-                            index=False
-                        )
-                        
-                        load_stats['records_loaded'] += len(batch_df)
-                        
-                    except Exception as e:
-                        error_msg = f"Error loading batch {batch_num}: {str(e)}"
-                        logger.error(error_msg)
-                        load_stats['errors'].append(error_msg)
-                        load_stats['records_failed'] += len(batch_df)
+    def load_customer_transactions(self, transactions: List[Dict[str, Any]], target_path: str) -> int:
+        """
+        Load customer transaction data to target system.
+        
+        Args:
+            transactions: List of transformed transaction records
+            target_path: Path to target file or database
             
-            # Write consolidated file
-            df.to_parquet(
-                f"{target_path}_consolidated.parquet",
-                engine='pyarrow',
-                compression='snappy',
-                index=False
-            )
+        Returns:
+            Number of records successfully loaded
+        """
+        logger.info(f"Loading {len(transactions)} transaction records to {target_path}")
+        
+        try:
+            loaded_count = 0
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             
-            end_time = datetime.now()
-            load_stats['end_time'] = end_time.isoformat()
-            load_stats['duration_seconds'] = (end_time - start_time).total_seconds()
-            load_stats['records_per_second'] = (
-                load_stats['records_loaded'] / load_stats['duration_seconds']
-                if load_stats['duration_seconds'] > 0 else 0
-            )
-            
-            # Write load statistics
-            self._write_load_stats(load_stats, f"{target_path}_load_stats.json")
-            
-            logger.info(f"Transaction load completed: {load_stats}")
-            return load_stats
+            with open(target_path, 'w', newline='', encoding='utf-8') as f:
+                if transactions:
+                    fieldnames = transactions[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    
+                    for transaction in transactions:
+                        try:
+                            writer.writerow(transaction)
+                            loaded_count += 1
+                        except Exception as e:
+                            logger.error(f"Error loading transaction {transaction.get('transaction_id')}: {str(e)}")
+                            
+            logger.info(f"Successfully loaded {loaded_count} transaction records")
+            return loaded_count
             
         except Exception as e:
             logger.error(f"Error loading transaction data: {str(e)}")
             raise
-    
-    def load_aggregated_metrics(self, df: pd.DataFrame, target_path: str) -> Dict:
+            
+    def load_sales_orders(self, orders: List[Dict[str, Any]], target_path: str) -> int:
         """
-        Load aggregated customer metrics to target.
+        Load sales order data to target system.
         
         Args:
-            df: Aggregated metrics DataFrame
-            target_path: Path to target location
+            orders: List of transformed sales order records
+            target_path: Path to target file or database
             
         Returns:
-            Dictionary containing load statistics
+            Number of records successfully loaded
         """
+        logger.info(f"Loading {len(orders)} sales order records to {target_path}")
+        
         try:
-            logger.info(f"Loading {len(df)} aggregated metric records to {target_path}")
-            
-            start_time = datetime.now()
-            
-            # Create target directory
+            loaded_count = 0
             Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             
-            # Write metrics
-            df.to_parquet(
-                f"{target_path}.parquet",
-                engine='pyarrow',
-                compression='snappy',
-                index=False
-            )
-            
-            df.to_csv(
-                f"{target_path}.csv",
-                index=False,
-                encoding='utf-8'
-            )
-            
-            end_time = datetime.now()
-            
-            load_stats = {
-                'total_records': len(df),
-                'records_loaded': len(df),
-                'records_failed': 0,
-                'start_time': start_time.isoformat(),
-                'end_time': end_time.isoformat(),
-                'duration_seconds': (end_time - start_time).total_seconds(),
-                'errors': []
-            }
-            
-            self._write_load_stats(load_stats, f"{target_path}_load_stats.json")
-            
-            logger.info(f"Metrics load completed: {load_stats}")
-            return load_stats
+            with open(target_path, 'w', newline='', encoding='utf-8') as f:
+                if orders:
+                    fieldnames = orders[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    
+                    for order in orders:
+                        try:
+                            writer.writerow(order)
+                            loaded_count += 1
+                        except Exception as e:
+                            logger.error(f"Error loading order {order.get('order_id')}: {str(e)}")
+                            
+            logger.info(f"Successfully loaded {loaded_count} sales order records")
+            return loaded_count
             
         except Exception as e:
-            logger.error(f"Error loading aggregated metrics: {str(e)}")
+            logger.error(f"Error loading sales order data: {str(e)}")
             raise
-    
-    def validate_load(self, source_df: pd.DataFrame, target_path: str) -> Dict:
+            
+    def load_error_records(self, errors: List[Dict[str, Any]], error_path: str) -> int:
         """
-        Validate loaded data against source.
+        Load error records to error file.
         
         Args:
-            source_df: Source DataFrame
-            target_path: Path to loaded data
+            errors: List of error records
+            error_path: Path to error file
             
         Returns:
-            Dictionary containing validation results
+            Number of error records logged
         """
+        logger.info(f"Logging {len(errors)} error records to {error_path}")
+        
         try:
-            logger.info(f"Validating loaded data at {target_path}")
+            Path(error_path).parent.mkdir(parents=True, exist_ok=True)
             
-            # Read loaded data
-            loaded_df = pd.read_parquet(f"{target_path}_consolidated.parquet")
-            
-            validation_results = {
-                'source_record_count': len(source_df),
-                'target_record_count': len(loaded_df),
-                'record_count_match': len(source_df) == len(loaded_df),
-                'validation_timestamp': datetime.now().isoformat()
-            }
-            
-            # Check for data integrity
-            if validation_results['record_count_match']:
-                # Sample validation - check key fields
-                key_field = source_df.columns[0]
-                source_keys = set(source_df[key_field].unique())
-                target_keys = set(loaded_df[key_field].unique())
+            with open(error_path, 'w', encoding='utf-8') as f:
+                json.dump(errors, f, indent=2)
                 
-                validation_results['key_match'] = source_keys == target_keys
-                validation_results['missing_keys'] = list(source_keys - target_keys)
-                validation_results['extra_keys'] = list(target_keys - source_keys)
-            
-            logger.info(f"Validation results: {validation_results}")
-            return validation_results
+            logger.info(f"Successfully logged {len(errors)} error records")
+            return len(errors)
             
         except Exception as e:
-            logger.error(f"Error validating loaded data: {str(e)}")
+            logger.error(f"Error logging error records: {str(e)}")
             raise
-    
-    def _split_into_batches(self, df: pd.DataFrame, batch_size: int) -> List[pd.DataFrame]:
-        """Split DataFrame into batches."""
-        num_batches = (len(df) + batch_size - 1) // batch_size
-        return [df.iloc[i*batch_size:(i+1)*batch_size] for i in range(num_batches)]
-    
-    def _write_load_stats(self, stats: Dict, file_path: str):
-        """Write load statistics to file."""
-        try:
-            with open(file_path, 'w') as f:
-                json.dump(stats, f, indent=2, default=str)
-            logger.info(f"Load statistics written to {file_path}")
-        except Exception as e:
-            logger.warning(f"Could not write load statistics: {str(e)}")
