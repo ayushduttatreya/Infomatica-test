@@ -1,429 +1,358 @@
 """
-Extract Informatica repository mappings from XML file.
-Parses Informatica PowerCenter repository XML to extract mapping definitions,
-source/target definitions, and transformation logic.
+Sales Forecast Data Extraction Module
+Extracts customer and sales forecast data from source systems
 """
 
 import logging
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field, asdict
-import json
+from typing import Dict, Any, List
+import nipyapi
+from nipyapi.nifi import ProcessorConfigDTO, ProcessGroupEntity
+import yaml
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SourceField:
-    """Represents a source field definition."""
-    name: str
-    datatype: str
-    length: int
-    nullable: str
-    precision: int
-    scale: int
-    field_number: int
-    key_type: str = "NOT A KEY"
-    description: str = ""
-    business_name: str = ""
-
-
-@dataclass
-class SourceDefinition:
-    """Represents a source definition."""
-    name: str
-    database_type: str
-    description: str
-    fields: List[SourceField] = field(default_factory=list)
-    object_version: str = "1"
-    version_number: str = "1"
-
-
-@dataclass
-class TargetField:
-    """Represents a target field definition."""
-    name: str
-    datatype: str
-    length: int
-    nullable: str
-    precision: int
-    scale: int
-    field_number: int
-    key_type: str = "NOT A KEY"
-    description: str = ""
-
-
-@dataclass
-class TargetDefinition:
-    """Represents a target definition."""
-    name: str
-    database_type: str
-    description: str
-    fields: List[TargetField] = field(default_factory=list)
-    object_version: str = "1"
-
-
-@dataclass
-class TransformField:
-    """Represents a transformation field."""
-    name: str
-    datatype: str
-    precision: int
-    scale: int
-    expression: str = ""
-    description: str = ""
-    port_type: str = ""
-
-
-@dataclass
-class Transformation:
-    """Represents a transformation definition."""
-    name: str
-    type: str
-    description: str
-    fields: List[TransformField] = field(default_factory=list)
-    object_version: str = "1"
-    properties: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class MappingInstance:
-    """Represents a mapping instance (source/target/transformation usage)."""
-    name: str
-    type: str
-    transformation_name: str
-    transformation_type: str
-
-
-@dataclass
-class MappingConnector:
-    """Represents a connector between transformations."""
-    from_instance: str
-    from_field: str
-    to_instance: str
-    to_field: str
-
-
-@dataclass
-class Mapping:
-    """Represents a complete mapping definition."""
-    name: str
-    description: str
-    is_valid: str
-    instances: List[MappingInstance] = field(default_factory=list)
-    connectors: List[MappingConnector] = field(default_factory=list)
-    object_version: str = "1"
-
-
-@dataclass
-class Folder:
-    """Represents a repository folder."""
-    name: str
-    owner: str
-    description: str
-    sources: List[SourceDefinition] = field(default_factory=list)
-    targets: List[TargetDefinition] = field(default_factory=list)
-    transformations: List[Transformation] = field(default_factory=list)
-    mappings: List[Mapping] = field(default_factory=list)
-    version: str = "1"
-
-
-@dataclass
-class Repository:
-    """Represents the complete Informatica repository."""
-    name: str
-    version: str
-    codepage: str
-    database_type: str
-    folders: List[Folder] = field(default_factory=list)
-    creation_date: str = ""
-    repository_version: str = ""
-
-
-class InformaticaXMLParser:
-    """Parser for Informatica PowerCenter repository XML files."""
-
-    def __init__(self, xml_path: str):
+class SalesForecastExtractor:
+    """Handles extraction of sales forecast data from source systems"""
+    
+    def __init__(self, config_path: str = "config.yaml"):
         """
-        Initialize the parser.
+        Initialize the extractor with configuration
         
         Args:
-            xml_path: Path to the Informatica repository XML file
+            config_path: Path to configuration file
         """
-        self.xml_path = Path(xml_path)
-        self.tree: Optional[ET.ElementTree] = None
-        self.root: Optional[ET.Element] = None
-
-    def parse(self) -> Repository:
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+        
+        self.nifi_config = self.config['nifi']
+        self.source_config = self.config['sources']
+        self.canvas = None
+        
+    def connect_to_nifi(self) -> bool:
         """
-        Parse the XML file and extract repository structure.
+        Establish connection to NiFi instance
         
         Returns:
-            Repository object containing all parsed definitions
-            
-        Raises:
-            FileNotFoundError: If XML file does not exist
-            ET.ParseError: If XML is malformed
+            bool: True if connection successful
         """
-        logger.info(f"Parsing Informatica repository XML: {self.xml_path}")
-        
-        if not self.xml_path.exists():
-            raise FileNotFoundError(f"XML file not found: {self.xml_path}")
-        
         try:
-            self.tree = ET.parse(self.xml_path)
-            self.root = self.tree.getroot()
-        except ET.ParseError as e:
-            logger.error(f"Failed to parse XML: {e}")
+            nipyapi.config.nifi_config.host = self.nifi_config['host']
+            nipyapi.config.nifi_config.port = self.nifi_config['port']
+            
+            # Test connection
+            nipyapi.canvas.get_root_pg_id()
+            logger.info(f"Successfully connected to NiFi at {self.nifi_config['host']}:{self.nifi_config['port']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to NiFi: {str(e)}")
             raise
-        
-        if self.root.tag != "POWERMART":
-            raise ValueError(f"Invalid root element: {self.root.tag}, expected POWERMART")
-        
-        repository = self._parse_repository()
-        logger.info(f"Successfully parsed repository: {repository.name}")
-        logger.info(f"Found {len(repository.folders)} folders")
-        
-        return repository
-
-    def _parse_repository(self) -> Repository:
-        """Parse the REPOSITORY element."""
-        repo_elem = self.root.find("REPOSITORY")
-        if repo_elem is None:
-            raise ValueError("No REPOSITORY element found in XML")
-        
-        repository = Repository(
-            name=repo_elem.get("NAME", ""),
-            version=repo_elem.get("VERSION", ""),
-            codepage=repo_elem.get("CODEPAGE", "UTF-8"),
-            database_type=repo_elem.get("DATABASETYPE", ""),
-            creation_date=self.root.get("CREATION_DATE", ""),
-            repository_version=self.root.get("REPOSITORY_VERSION", "")
-        )
-        
-        for folder_elem in repo_elem.findall("FOLDER"):
-            folder = self._parse_folder(folder_elem)
-            repository.folders.append(folder)
-        
-        return repository
-
-    def _parse_folder(self, folder_elem: ET.Element) -> Folder:
-        """Parse a FOLDER element."""
-        folder = Folder(
-            name=folder_elem.get("NAME", ""),
-            owner=folder_elem.get("OWNER", ""),
-            description=folder_elem.get("DESCRIPTION", ""),
-            version=folder_elem.get("VERSION", "1")
-        )
-        
-        logger.info(f"Parsing folder: {folder.name}")
-        
-        # Parse sources
-        for source_elem in folder_elem.findall("SOURCE"):
-            source = self._parse_source(source_elem)
-            folder.sources.append(source)
-        
-        # Parse targets
-        for target_elem in folder_elem.findall("TARGET"):
-            target = self._parse_target(target_elem)
-            folder.targets.append(target)
-        
-        # Parse transformations
-        for transform_elem in folder_elem.findall("TRANSFORMATION"):
-            transformation = self._parse_transformation(transform_elem)
-            folder.transformations.append(transformation)
-        
-        # Parse mappings
-        for mapping_elem in folder_elem.findall("MAPPING"):
-            mapping = self._parse_mapping(mapping_elem)
-            folder.mappings.append(mapping)
-        
-        logger.info(f"Folder {folder.name}: {len(folder.sources)} sources, "
-                   f"{len(folder.targets)} targets, "
-                   f"{len(folder.transformations)} transformations, "
-                   f"{len(folder.mappings)} mappings")
-        
-        return folder
-
-    def _parse_source(self, source_elem: ET.Element) -> SourceDefinition:
-        """Parse a SOURCE element."""
-        source = SourceDefinition(
-            name=source_elem.get("NAME", ""),
-            database_type=source_elem.get("DATABASETYPE", ""),
-            description=source_elem.get("DESCRIPTION", ""),
-            object_version=source_elem.get("OBJECTVERSION", "1"),
-            version_number=source_elem.get("VERSIONNUMBER", "1")
-        )
-        
-        for field_elem in source_elem.findall("SOURCEFIELD"):
-            field = SourceField(
-                name=field_elem.get("NAME", ""),
-                datatype=field_elem.get("DATATYPE", "string"),
-                length=int(field_elem.get("LENGTH", "0")),
-                nullable=field_elem.get("NULLABLE", "NULL"),
-                precision=int(field_elem.get("PRECISION", "0")),
-                scale=int(field_elem.get("SCALE", "0")),
-                field_number=int(field_elem.get("FIELDNUMBER", "0")),
-                key_type=field_elem.get("KEYTYPE", "NOT A KEY"),
-                description=field_elem.get("DESCRIPTION", ""),
-                business_name=field_elem.get("BUSINESSNAME", "")
-            )
-            source.fields.append(field)
-        
-        return source
-
-    def _parse_target(self, target_elem: ET.Element) -> TargetDefinition:
-        """Parse a TARGET element."""
-        target = TargetDefinition(
-            name=target_elem.get("NAME", ""),
-            database_type=target_elem.get("DATABASETYPE", ""),
-            description=target_elem.get("DESCRIPTION", ""),
-            object_version=target_elem.get("OBJECTVERSION", "1")
-        )
-        
-        for field_elem in target_elem.findall("TARGETFIELD"):
-            field = TargetField(
-                name=field_elem.get("NAME", ""),
-                datatype=field_elem.get("DATATYPE", "string"),
-                length=int(field_elem.get("LENGTH", "0")),
-                nullable=field_elem.get("NULLABLE", "NULL"),
-                precision=int(field_elem.get("PRECISION", "0")),
-                scale=int(field_elem.get("SCALE", "0")),
-                field_number=int(field_elem.get("FIELDNUMBER", "0")),
-                key_type=field_elem.get("KEYTYPE", "NOT A KEY"),
-                description=field_elem.get("DESCRIPTION", "")
-            )
-            target.fields.append(field)
-        
-        return target
-
-    def _parse_transformation(self, transform_elem: ET.Element) -> Transformation:
-        """Parse a TRANSFORMATION element."""
-        transformation = Transformation(
-            name=transform_elem.get("NAME", ""),
-            type=transform_elem.get("TYPE", ""),
-            description=transform_elem.get("DESCRIPTION", ""),
-            object_version=transform_elem.get("OBJECTVERSION", "1")
-        )
-        
-        # Parse transformation fields
-        for field_elem in transform_elem.findall("TRANSFORMFIELD"):
-            field = TransformField(
-                name=field_elem.get("NAME", ""),
-                datatype=field_elem.get("DATATYPE", "string"),
-                precision=int(field_elem.get("PRECISION", "0")),
-                scale=int(field_elem.get("SCALE", "0")),
-                expression=field_elem.get("EXPRESSION", ""),
-                description=field_elem.get("DESCRIPTION", ""),
-                port_type=field_elem.get("PORTTYPE", "")
-            )
-            transformation.fields.append(field)
-        
-        # Parse table attributes (properties)
-        for attr_elem in transform_elem.findall("TABLEATTRIBUTE"):
-            attr_name = attr_elem.get("NAME", "")
-            attr_value = attr_elem.get("VALUE", "")
-            if attr_name:
-                transformation.properties[attr_name] = attr_value
-        
-        return transformation
-
-    def _parse_mapping(self, mapping_elem: ET.Element) -> Mapping:
-        """Parse a MAPPING element."""
-        mapping = Mapping(
-            name=mapping_elem.get("NAME", ""),
-            description=mapping_elem.get("DESCRIPTION", ""),
-            is_valid=mapping_elem.get("ISVALID", "YES"),
-            object_version=mapping_elem.get("OBJECTVERSION", "1")
-        )
-        
-        # Parse instances
-        for instance_elem in mapping_elem.findall("INSTANCE"):
-            instance = MappingInstance(
-                name=instance_elem.get("NAME", ""),
-                type=instance_elem.get("TYPE", ""),
-                transformation_name=instance_elem.get("TRANSFORMATION_NAME", ""),
-                transformation_type=instance_elem.get("TRANSFORMATION_TYPE", "")
-            )
-            mapping.instances.append(instance)
-        
-        # Parse connectors
-        for connector_elem in mapping_elem.findall("CONNECTOR"):
-            connector = MappingConnector(
-                from_instance=connector_elem.get("FROMINSTANCE", ""),
-                from_field=connector_elem.get("FROMFIELD", ""),
-                to_instance=connector_elem.get("TOINSTANCE", ""),
-                to_field=connector_elem.get("TOFIELD", "")
-            )
-            mapping.connectors.append(connector)
-        
-        return mapping
-
-    def export_to_json(self, repository: Repository, output_path: str) -> None:
+    
+    def create_extraction_process_group(self, parent_pg_id: str = None) -> ProcessGroupEntity:
         """
-        Export parsed repository to JSON format.
+        Create process group for extraction workflow
         
         Args:
-            repository: Parsed repository object
-            output_path: Path to output JSON file
+            parent_pg_id: Parent process group ID, defaults to root
+            
+        Returns:
+            ProcessGroupEntity: Created process group
         """
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Convert dataclasses to dict
-        repo_dict = self._to_dict(repository)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(repo_dict, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Exported repository to JSON: {output_file}")
-
-    def _to_dict(self, obj: Any) -> Any:
-        """Recursively convert dataclass objects to dictionaries."""
-        if hasattr(obj, '__dataclass_fields__'):
-            result = {}
-            for field_name, field_value in asdict(obj).items():
-                result[field_name] = self._to_dict(field_value)
-            return result
-        elif isinstance(obj, list):
-            return [self._to_dict(item) for item in obj]
-        elif isinstance(obj, dict):
-            return {key: self._to_dict(value) for key, value in obj.items()}
-        else:
-            return obj
-
-
-def extract_informatica_repository(xml_path: str, output_json_path: Optional[str] = None) -> Repository:
-    """
-    Main extraction function to parse Informatica repository XML.
+        try:
+            if parent_pg_id is None:
+                parent_pg_id = nipyapi.canvas.get_root_pg_id()
+            
+            pg_name = self.config['process_groups']['extraction']['name']
+            
+            # Check if process group already exists
+            existing_pg = nipyapi.canvas.get_process_group(pg_name, 'name')
+            if existing_pg:
+                logger.info(f"Process group '{pg_name}' already exists")
+                return existing_pg
+            
+            # Create new process group
+            process_group = nipyapi.canvas.create_process_group(
+                parent_pg=nipyapi.canvas.get_process_group(parent_pg_id, 'id'),
+                name=pg_name,
+                location=(100, 100)
+            )
+            
+            logger.info(f"Created extraction process group: {pg_name}")
+            return process_group
+            
+        except Exception as e:
+            logger.error(f"Failed to create extraction process group: {str(e)}")
+            raise
     
-    Args:
-        xml_path: Path to Informatica repository XML file
-        output_json_path: Optional path to export JSON output
+    def create_customer_source_processor(self, process_group: ProcessGroupEntity) -> Any:
+        """
+        Create processor to read customer source data
         
-    Returns:
-        Parsed Repository object
-    """
-    parser = InformaticaXMLParser(xml_path)
-    repository = parser.parse()
+        Args:
+            process_group: Parent process group
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            customer_config = self.source_config['customers']
+            
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=process_group,
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.GetFile'),
+                location=(200, 200),
+                name='Extract_Customer_Data'
+            )
+            
+            # Configure processor properties
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Input Directory': customer_config['input_directory'],
+                'File Filter': customer_config['file_pattern'],
+                'Keep Source File': 'false',
+                'Recurse Subdirectories': 'false',
+                'Polling Interval': '10 sec',
+                'Batch Size': '10'
+            }
+            config.auto_terminated_relationships = []
+            
+            nipyapi.canvas.update_processor(processor, config)
+            
+            logger.info(f"Created customer source processor: {processor.id}")
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create customer source processor: {str(e)}")
+            raise
     
-    if output_json_path:
-        parser.export_to_json(repository, output_json_path)
+    def create_sales_forecast_source_processor(self, process_group: ProcessGroupEntity) -> Any:
+        """
+        Create processor to read sales forecast source data
+        
+        Args:
+            process_group: Parent process group
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            forecast_config = self.source_config['sales_forecast']
+            
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=process_group,
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.GetFile'),
+                location=(200, 400),
+                name='Extract_Sales_Forecast_Data'
+            )
+            
+            # Configure processor properties
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Input Directory': forecast_config['input_directory'],
+                'File Filter': forecast_config['file_pattern'],
+                'Keep Source File': 'false',
+                'Recurse Subdirectories': 'false',
+                'Polling Interval': '10 sec',
+                'Batch Size': '10'
+            }
+            config.auto_terminated_relationships = []
+            
+            nipyapi.canvas.update_processor(processor, config)
+            
+            logger.info(f"Created sales forecast source processor: {processor.id}")
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create sales forecast source processor: {str(e)}")
+            raise
     
-    return repository
+    def create_schema_validation_processor(self, process_group: ProcessGroupEntity, 
+                                          location: tuple, name: str) -> Any:
+        """
+        Create processor to validate data schema
+        
+        Args:
+            process_group: Parent process group
+            location: Processor location coordinates
+            name: Processor name
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=process_group,
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.ValidateRecord'),
+                location=location,
+                name=name
+            )
+            
+            # Configure processor properties
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Record Reader': 'CSVReader',
+                'Record Writer': 'CSVRecordSetWriter',
+                'Schema Access Strategy': 'Use String Fields From Header',
+                'Allow Extra Fields': 'true'
+            }
+            config.auto_terminated_relationships = []
+            
+            nipyapi.canvas.update_processor(processor, config)
+            
+            logger.info(f"Created schema validation processor: {name}")
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create schema validation processor: {str(e)}")
+            raise
+    
+    def create_error_handling_funnel(self, process_group: ProcessGroupEntity) -> Any:
+        """
+        Create funnel for error handling
+        
+        Args:
+            process_group: Parent process group
+            
+        Returns:
+            Funnel entity
+        """
+        try:
+            funnel = nipyapi.canvas.create_funnel(
+                parent_pg=process_group,
+                location=(800, 300)
+            )
+            
+            logger.info(f"Created error handling funnel: {funnel.id}")
+            return funnel
+            
+        except Exception as e:
+            logger.error(f"Failed to create error handling funnel: {str(e)}")
+            raise
+    
+    def build_extraction_pipeline(self) -> Dict[str, Any]:
+        """
+        Build complete extraction pipeline
+        
+        Returns:
+            Dictionary containing all created components
+        """
+        try:
+            logger.info("Building extraction pipeline...")
+            
+            # Connect to NiFi
+            self.connect_to_nifi()
+            
+            # Create process group
+            extraction_pg = self.create_extraction_process_group()
+            
+            # Create source processors
+            customer_processor = self.create_customer_source_processor(extraction_pg)
+            forecast_processor = self.create_sales_forecast_source_processor(extraction_pg)
+            
+            # Create validation processors
+            customer_validator = self.create_schema_validation_processor(
+                extraction_pg, 
+                (500, 200), 
+                'Validate_Customer_Schema'
+            )
+            forecast_validator = self.create_schema_validation_processor(
+                extraction_pg, 
+                (500, 400), 
+                'Validate_Forecast_Schema'
+            )
+            
+            # Create error handling funnel
+            error_funnel = self.create_error_handling_funnel(extraction_pg)
+            
+            # Create connections
+            self._create_connections(
+                extraction_pg,
+                customer_processor,
+                forecast_processor,
+                customer_validator,
+                forecast_validator,
+                error_funnel
+            )
+            
+            components = {
+                'process_group': extraction_pg,
+                'customer_processor': customer_processor,
+                'forecast_processor': forecast_processor,
+                'customer_validator': customer_validator,
+                'forecast_validator': forecast_validator,
+                'error_funnel': error_funnel
+            }
+            
+            logger.info("Extraction pipeline built successfully")
+            return components
+            
+        except Exception as e:
+            logger.error(f"Failed to build extraction pipeline: {str(e)}")
+            raise
+    
+    def _create_connections(self, process_group: ProcessGroupEntity, 
+                           customer_proc: Any, forecast_proc: Any,
+                           customer_val: Any, forecast_val: Any,
+                           error_funnel: Any) -> None:
+        """
+        Create connections between processors
+        
+        Args:
+            process_group: Parent process group
+            customer_proc: Customer source processor
+            forecast_proc: Forecast source processor
+            customer_val: Customer validator
+            forecast_val: Forecast validator
+            error_funnel: Error handling funnel
+        """
+        try:
+            # Customer source to validator
+            nipyapi.canvas.create_connection(
+                source=customer_proc,
+                target=customer_val,
+                relationships=['success']
+            )
+            
+            # Forecast source to validator
+            nipyapi.canvas.create_connection(
+                source=forecast_proc,
+                target=forecast_val,
+                relationships=['success']
+            )
+            
+            # Validation failures to error funnel
+            nipyapi.canvas.create_connection(
+                source=customer_val,
+                target=error_funnel,
+                relationships=['invalid']
+            )
+            
+            nipyapi.canvas.create_connection(
+                source=forecast_val,
+                target=error_funnel,
+                relationships=['invalid']
+            )
+            
+            logger.info("Created all connections in extraction pipeline")
+            
+        except Exception as e:
+            logger.error(f"Failed to create connections: {str(e)}")
+            raise
+
+
+def main():
+    """Main execution function"""
+    try:
+        extractor = SalesForecastExtractor()
+        components = extractor.build_extraction_pipeline()
+        logger.info(f"Extraction pipeline deployed with {len(components)} components")
+        
+    except Exception as e:
+        logger.error(f"Extraction pipeline deployment failed: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Example usage
-    repo = extract_informatica_repository(
-        "mappings/informatica_repository.xml",
-        "output/repository_parsed.json"
-    )
-    print(f"Parsed repository: {repo.name}")
-    print(f"Total folders: {len(repo.folders)}")
+    main()
