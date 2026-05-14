@@ -1,339 +1,258 @@
 """
-Transform module for customer address management logic.
-Implements address type validation, primary address flag management, and customer ID lookups.
+Transform module for customer address pipeline.
+Handles validation, cleansing, and enrichment of address data.
 """
-
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+import re
+from typing import Dict, Any, Tuple
 import pandas as pd
-import numpy as np
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
 class CustomerAddressTransformer:
-    """Transforms customer and address data with business logic."""
-    
-    # Valid address types based on business rules
-    VALID_ADDRESS_TYPES = {
-        'HOME', 'WORK', 'BILLING', 'SHIPPING', 'MAILING', 'OTHER'
-    }
-    
-    # Valid country codes (ISO 3166-1 alpha-2)
-    VALID_COUNTRIES = {
-        'US', 'CA', 'MX', 'GB', 'DE', 'FR', 'IT', 'ES', 'AU', 'JP', 'CN', 'IN'
-    }
-    
-    # Valid US state codes
-    VALID_US_STATES = {
-        'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-        'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-        'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-        'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-        'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
-    }
+    """Transforms and validates customer address data."""
     
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize transformer with configuration.
         
         Args:
-            config: Configuration dictionary
+            config: Configuration dictionary containing validation rules
         """
         self.config = config
+        self.validation_config = config.get('validation', {})
         self.transform_config = config.get('transform', {})
-        self.validation_config = self.transform_config.get('validation', {})
         
-    def validate_address_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Validation patterns
+        self.zip_pattern = re.compile(r'^\d{5}(-\d{4})?$')
+        self.email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+        self.phone_pattern = re.compile(r'^\+?1?\d{10,15}$')
+        
+        # Valid state codes
+        self.valid_states = set([
+            'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+            'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+            'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+            'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+            'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
+        ])
+        
+        # Valid country codes
+        self.valid_countries = set(['US', 'USA', 'CA', 'MX'])
+        
+    def validate_address(self, row: pd.Series) -> Tuple[bool, str]:
         """
-        Validate and standardize address types.
+        Validate a single address record.
         
         Args:
-            df: DataFrame with address_type column
+            row: Address record as pandas Series
             
         Returns:
-            DataFrame with validated address_type and validation flag
+            Tuple of (is_valid, error_message)
         """
-        logger.info("Validating address types")
+        errors = []
         
-        df = df.copy()
+        # Required field validation
+        if pd.isna(row.get('street_address')) or not str(row.get('street_address')).strip():
+            errors.append("Missing street address")
+            
+        if pd.isna(row.get('city')) or not str(row.get('city')).strip():
+            errors.append("Missing city")
+            
+        # State validation
+        state = str(row.get('state_province', '')).strip().upper()
+        if state and state not in self.valid_states:
+            errors.append(f"Invalid state code: {state}")
+            
+        # Postal code validation
+        postal_code = str(row.get('postal_code', '')).strip()
+        if postal_code and not self.zip_pattern.match(postal_code):
+            errors.append(f"Invalid postal code format: {postal_code}")
+            
+        # Country validation
+        country = str(row.get('country_code', '')).strip().upper()
+        if country and country not in self.valid_countries:
+            errors.append(f"Invalid country code: {country}")
+            
+        is_valid = len(errors) == 0
+        error_message = "; ".join(errors) if errors else ""
         
-        # Standardize to uppercase and strip whitespace
-        df['address_type'] = df['address_type'].str.upper().str.strip()
+        return is_valid, error_message
         
-        # Create validation flag
-        df['address_type_valid'] = df['address_type'].isin(self.VALID_ADDRESS_TYPES)
-        
-        # Handle invalid types based on config
-        default_type = self.validation_config.get('default_address_type', 'OTHER')
-        
-        invalid_count = (~df['address_type_valid']).sum()
-        if invalid_count > 0:
-            logger.warning(f"Found {invalid_count} invalid address types, setting to {default_type}")
-            df.loc[~df['address_type_valid'], 'address_type'] = default_type
-            df.loc[~df['address_type_valid'], 'address_type_valid'] = True
-        
-        logger.info(f"Address type validation complete: {len(df)} records processed")
-        return df
-    
-    def set_primary_address_flags(self, df: pd.DataFrame) -> pd.DataFrame:
+    def validate_customer(self, row: pd.Series) -> Tuple[bool, str]:
         """
-        Set primary address flags ensuring only one primary address per customer.
-        Business rule: If multiple addresses marked as primary, keep the most recent.
-        If no primary address, set the first active address as primary.
+        Validate a single customer record.
         
         Args:
-            df: DataFrame with customer addresses
+            row: Customer record as pandas Series
             
         Returns:
-            DataFrame with corrected is_primary flags
+            Tuple of (is_valid, error_message)
         """
-        logger.info("Setting primary address flags")
+        errors = []
         
-        df = df.copy()
-        
-        # Convert is_primary to boolean
-        df['is_primary'] = df['is_primary'].map({
-            'Y': True, 'YES': True, '1': True, 'TRUE': True, True: True,
-            'N': False, 'NO': False, '0': False, 'FALSE': False, False: False
-        }).fillna(False)
-        
-        # Convert is_active to boolean
-        df['is_active'] = df['is_active'].map({
-            'Y': True, 'YES': True, '1': True, 'TRUE': True, True: True,
-            'N': False, 'NO': False, '0': False, 'FALSE': False, False: False
-        }).fillna(True)
-        
-        # Sort by customer_id and address_id for consistent processing
-        df = df.sort_values(['customer_id', 'address_id'])
-        
-        # Reset all primary flags first
-        df['is_primary'] = False
-        
-        # Group by customer and set primary address
-        def set_primary_for_customer(group):
-            active_addresses = group[group['is_active']]
+        # Email validation
+        email = str(row.get('email', '')).strip()
+        if email and not self.email_pattern.match(email):
+            errors.append(f"Invalid email format: {email}")
             
-            if len(active_addresses) == 0:
-                # No active addresses, no primary
-                return group
+        # Phone validation
+        phone = str(row.get('phone', '')).strip().replace('-', '').replace(' ', '')
+        if phone and not self.phone_pattern.match(phone):
+            errors.append(f"Invalid phone format: {phone}")
             
-            # Set the first active address as primary
-            first_active_idx = active_addresses.index[0]
-            group.loc[first_active_idx, 'is_primary'] = True
+        # Name validation
+        if pd.isna(row.get('first_name')) or not str(row.get('first_name')).strip():
+            errors.append("Missing first name")
             
-            return group
+        if pd.isna(row.get('last_name')) or not str(row.get('last_name')).strip():
+            errors.append("Missing last name")
+            
+        is_valid = len(errors) == 0
+        error_message = "; ".join(errors) if errors else ""
         
-        df = df.groupby('customer_id', group_keys=False).apply(set_primary_for_customer)
+        return is_valid, error_message
         
-        # Log statistics
-        primary_count = df['is_primary'].sum()
-        customer_count = df['customer_id'].nunique()
-        logger.info(f"Primary address flags set: {primary_count} primary addresses for {customer_count} customers")
-        
-        return df
-    
-    def validate_geography(self, df: pd.DataFrame) -> pd.DataFrame:
+    def cleanse_address(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Validate geographic data (country, state, zip code).
+        Cleanse and standardize address data.
         
         Args:
-            df: DataFrame with geographic fields
+            df: Address DataFrame
             
         Returns:
-            DataFrame with validation flags
+            Cleansed DataFrame
         """
-        logger.info("Validating geographic data")
-        
         df = df.copy()
+        
+        # Standardize state codes
+        df['state_province'] = df['state_province'].str.strip().str.upper()
         
         # Standardize country codes
-        df['country'] = df['country'].str.upper().str.strip()
-        df['country_valid'] = df['country'].isin(self.VALID_COUNTRIES)
+        df['country_code'] = df['country_code'].str.strip().str.upper()
+        df['country_code'] = df['country_code'].replace({'USA': 'US'})
         
-        # Validate US states
-        df['state'] = df['state'].str.upper().str.strip()
-        df['state_valid'] = True  # Default to valid
+        # Standardize postal codes
+        df['postal_code'] = df['postal_code'].str.strip().str.upper()
         
-        # For US addresses, validate state codes
-        us_mask = df['country'] == 'US'
-        df.loc[us_mask, 'state_valid'] = df.loc[us_mask, 'state'].isin(self.VALID_US_STATES)
-        
-        # Validate zip code format for US (5 digits or 5+4 format)
-        df['zip_code_valid'] = True
-        us_zip_pattern = r'^\d{5}(-\d{4})?$'
-        df.loc[us_mask, 'zip_code_valid'] = df.loc[us_mask, 'zip_code'].str.match(us_zip_pattern, na=False)
-        
-        # Log validation results
-        invalid_country = (~df['country_valid']).sum()
-        invalid_state = (~df['state_valid']).sum()
-        invalid_zip = (~df['zip_code_valid']).sum()
-        
-        if invalid_country > 0:
-            logger.warning(f"Found {invalid_country} invalid country codes")
-        if invalid_state > 0:
-            logger.warning(f"Found {invalid_state} invalid state codes")
-        if invalid_zip > 0:
-            logger.warning(f"Found {invalid_zip} invalid zip codes")
-        
-        return df
-    
-    def enrich_with_customer_data(
-        self, 
-        addresses_df: pd.DataFrame, 
-        customers_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        Enrich address data with customer information via customer ID lookup.
-        
-        Args:
-            addresses_df: Address DataFrame
-            customers_df: Customer DataFrame
-            
-        Returns:
-            Enriched DataFrame with customer information
-        """
-        logger.info("Enriching addresses with customer data")
-        
-        # Select relevant customer fields for enrichment
-        customer_fields = [
-            'customer_id', 'first_name', 'last_name', 
-            'email', 'phone', 'status', 'registration_date'
-        ]
-        
-        customers_subset = customers_df[customer_fields].copy()
-        
-        # Perform left join to preserve all addresses
-        enriched_df = addresses_df.merge(
-            customers_subset,
-            on='customer_id',
-            how='left',
-            suffixes=('', '_customer')
-        )
-        
-        # Flag addresses without matching customer
-        enriched_df['customer_found'] = enriched_df['first_name'].notna()
-        
-        orphaned_count = (~enriched_df['customer_found']).sum()
-        if orphaned_count > 0:
-            logger.warning(f"Found {orphaned_count} addresses without matching customer records")
-        
-        logger.info(f"Enrichment complete: {len(enriched_df)} records")
-        return enriched_df
-    
-    def standardize_address_format(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Standardize address formatting (trim, uppercase where appropriate).
-        
-        Args:
-            df: DataFrame with address fields
-            
-        Returns:
-            DataFrame with standardized addresses
-        """
-        logger.info("Standardizing address format")
-        
-        df = df.copy()
-        
-        # Trim whitespace from all string fields
-        string_fields = ['address_line1', 'address_line2', 'city', 'state', 'country']
-        for field in string_fields:
+        # Trim whitespace from text fields
+        text_fields = ['street_address', 'street_address2', 'city', 'address_type']
+        for field in text_fields:
             if field in df.columns:
                 df[field] = df[field].str.strip()
-        
-        # Uppercase state and country codes
-        if 'state' in df.columns:
-            df['state'] = df['state'].str.upper()
-        if 'country' in df.columns:
-            df['country'] = df['country'].str.upper()
-        
-        # Title case for city names
-        if 'city' in df.columns:
-            df['city'] = df['city'].str.title()
-        
-        # Standardize zip code format (remove spaces, ensure proper format)
-        if 'zip_code' in df.columns:
-            df['zip_code'] = df['zip_code'].str.replace(' ', '').str.replace('-', '')
-            # Re-add hyphen for 9-digit US zip codes
-            us_mask = (df['country'] == 'US') & (df['zip_code'].str.len() == 9)
-            df.loc[us_mask, 'zip_code'] = (
-                df.loc[us_mask, 'zip_code'].str[:5] + '-' + 
-                df.loc[us_mask, 'zip_code'].str[5:]
-            )
-        
-        logger.info("Address standardization complete")
+                
+        # Standardize boolean fields
+        if 'is_primary' in df.columns:
+            df['is_primary'] = df['is_primary'].map({
+                'Y': True, 'N': False, 'YES': True, 'NO': False,
+                '1': True, '0': False, 1: True, 0: False,
+                True: True, False: False
+            })
+            
+        if 'is_active' in df.columns:
+            df['is_active'] = df['is_active'].map({
+                'Y': True, 'N': False, 'YES': True, 'NO': False,
+                '1': True, '0': False, 1: True, 0: False,
+                True: True, False: False
+            })
+            
         return df
-    
-    def add_audit_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        
+    def enrich_addresses(self, addresses: pd.DataFrame, customers: pd.DataFrame) -> pd.DataFrame:
         """
-        Add audit fields for tracking transformations.
+        Enrich address data with customer information.
         
         Args:
-            df: DataFrame to add audit fields to
+            addresses: Address DataFrame
+            customers: Customer DataFrame
             
         Returns:
-            DataFrame with audit fields
+            Enriched address DataFrame
         """
-        df = df.copy()
+        # Merge customer data
+        enriched = addresses.merge(
+            customers[['customer_id', 'first_name', 'last_name', 'email', 'status']],
+            on='customer_id',
+            how='left'
+        )
         
-        current_timestamp = datetime.now()
-        df['transform_timestamp'] = current_timestamp
-        df['transform_version'] = self.config.get('version', '1.0.0')
+        # Add processing metadata
+        enriched['processed_date'] = datetime.now()
+        enriched['record_hash'] = enriched.apply(
+            lambda row: hash(f"{row['address_id']}_{row['customer_id']}_{row['street_address']}"),
+            axis=1
+        )
         
-        return df
-    
-    def transform_addresses(
-        self, 
-        addresses_df: pd.DataFrame, 
-        customers_df: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        return enriched
+        
+    def transform(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
-        Execute full transformation pipeline for address data.
+        Execute full transformation pipeline.
         
         Args:
-            addresses_df: Raw address data
-            customers_df: Raw customer data
+            data: Dictionary containing customers and addresses DataFrames
             
         Returns:
-            Tuple of (transformed addresses, error records)
+            Dictionary containing transformed data and validation results
         """
-        logger.info("Starting address transformation pipeline")
+        customers = data['customers'].copy()
+        addresses = data['addresses'].copy()
         
-        try:
-            # Step 1: Validate address types
-            df = self.validate_address_type(addresses_df)
-            
-            # Step 2: Validate geography
-            df = self.validate_geography(df)
-            
-            # Step 3: Standardize address format
-            df = self.standardize_address_format(df)
-            
-            # Step 4: Set primary address flags
-            df = self.set_primary_address_flags(df)
-            
-            # Step 5: Enrich with customer data
-            df = self.enrich_with_customer_data(df, customers_df)
-            
-            # Step 6: Add audit fields
-            df = self.add_audit_fields(df)
-            
-            # Separate valid and error records
-            validation_columns = [
-                'address_type_valid', 'country_valid', 
-                'state_valid', 'zip_code_valid', 'customer_found'
-            ]
-            
-            df['all_validations_passed'] = df[validation_columns].all(axis=1)
-            
-            valid_df = df[df['all_validations_passed']].copy()
-            error_df = df[~df['all_validations_passed']].copy()
-            
-            logger.info(f"Transformation complete: {len(valid_df)} valid, {len(error_df)} error records")
-            
-            return valid_df, error_df
-            
-        except Exception as e:
-            logger.error(f"Transformation pipeline failed: {e}")
-            raise
+        logger.info("Starting transformation pipeline")
+        
+        # Validate customers
+        logger.info("Validating customer records")
+        customer_validation = customers.apply(self.validate_customer, axis=1)
+        customers['is_valid'] = customer_validation.apply(lambda x: x[0])
+        customers['validation_errors'] = customer_validation.apply(lambda x: x[1])
+        
+        valid_customers = customers[customers['is_valid']].copy()
+        invalid_customers = customers[~customers['is_valid']].copy()
+        
+        logger.info(f"Valid customers: {len(valid_customers)}, Invalid: {len(invalid_customers)}")
+        
+        # Cleanse addresses
+        logger.info("Cleansing address records")
+        addresses = self.cleanse_address(addresses)
+        
+        # Validate addresses
+        logger.info("Validating address records")
+        address_validation = addresses.apply(self.validate_address, axis=1)
+        addresses['is_valid'] = address_validation.apply(lambda x: x[0])
+        addresses['validation_errors'] = address_validation.apply(lambda x: x[1])
+        
+        valid_addresses = addresses[addresses['is_valid']].copy()
+        invalid_addresses = addresses[~addresses['is_valid']].copy()
+        
+        logger.info(f"Valid addresses: {len(valid_addresses)}, Invalid: {len(invalid_addresses)}")
+        
+        # Check for orphaned addresses (no matching customer)
+        valid_customer_ids = set(valid_customers['customer_id'])
+        valid_addresses['has_customer'] = valid_addresses['customer_id'].isin(valid_customer_ids)
+        
+        orphaned_addresses = valid_addresses[~valid_addresses['has_customer']].copy()
+        valid_addresses = valid_addresses[valid_addresses['has_customer']].copy()
+        
+        logger.info(f"Orphaned addresses (no valid customer): {len(orphaned_addresses)}")
+        
+        # Enrich valid addresses
+        logger.info("Enriching address records")
+        enriched_addresses = self.enrich_addresses(valid_addresses, valid_customers)
+        
+        # Check for duplicate addresses
+        duplicate_check = enriched_addresses.groupby(
+            ['customer_id', 'street_address', 'city', 'postal_code']
+        ).size().reset_index(name='count')
+        duplicates = duplicate_check[duplicate_check['count'] > 1]
+        
+        logger.info(f"Duplicate address groups found: {len(duplicates)}")
+        
+        return {
+            'valid_addresses': enriched_addresses,
+            'invalid_addresses': invalid_addresses,
+            'invalid_customers': invalid_customers,
+            'orphaned_addresses': orphaned_addresses,
+            'duplicate_summary': duplicates
+        }
