@@ -1,318 +1,468 @@
 """
-Transform module for customer transaction loading pipeline.
-Handles data transformation, enrichment, and business rule application.
+Transform module for Line Item Aggregation Logic
+Aggregates line items to order level with grouping and summation
 """
 
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
-import pandas as pd
-import numpy as np
-from hashlib import sha256
+from typing import Dict, List, Any, Optional
+from decimal import Decimal
+import nipyapi
+from nipyapi.nifi import ProcessorConfigDTO
+import yaml
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DataTransformer:
-    """Transforms customer and transaction data according to business rules."""
+class LineItemAggregator:
+    """Aggregates line items to order level"""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config_path: str = "config.yaml"):
         """
-        Initialize the data transformer.
+        Initialize the aggregator with configuration
         
         Args:
-            config: Configuration dictionary containing transformation rules
+            config_path: Path to configuration file
         """
-        self.config = config
-        self.transform_config = config.get('transformation', {})
-        self.business_rules = self.transform_config.get('business_rules', {})
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
         
-    def transform_customers(self, df: pd.DataFrame) -> pd.DataFrame:
+        self.nifi_config = self.config['nifi']
+        self.aggregation_config = self.config['aggregation']
+        
+    def create_process_group(self, parent_pg_id: str, group_name: str) -> Any:
         """
-        Transform customer data with cleansing and enrichment.
+        Create a process group for line item aggregation
         
         Args:
-            df: Raw customer DataFrame
+            parent_pg_id: Parent process group ID
+            group_name: Name for the new process group
             
         Returns:
-            Transformed customer DataFrame
+            ProcessGroupEntity: Created process group
         """
         try:
-            logger.info(f"Transforming {len(df)} customer records")
-            
-            df_transformed = df.copy()
-            
-            # Standardize names
-            df_transformed['first_name'] = df_transformed['first_name'].str.strip().str.title()
-            df_transformed['last_name'] = df_transformed['last_name'].str.strip().str.title()
-            df_transformed['full_name'] = (
-                df_transformed['first_name'] + ' ' + df_transformed['last_name']
+            pg = nipyapi.canvas.create_process_group(
+                parent_pg=nipyapi.canvas.get_process_group(parent_pg_id, 'id'),
+                new_pg_name=group_name,
+                location=(800.0, 400.0)
             )
-            
-            # Standardize email
-            df_transformed['email'] = df_transformed['email'].str.lower().str.strip()
-            df_transformed['email_domain'] = df_transformed['email'].str.split('@').str[1]
-            
-            # Format phone numbers
-            df_transformed['phone'] = df_transformed['phone'].apply(self._format_phone)
-            
-            # Standardize addresses
-            df_transformed['address_line1'] = df_transformed['address_line1'].str.strip().str.title()
-            df_transformed['city'] = df_transformed['city'].str.strip().str.title()
-            df_transformed['state'] = df_transformed['state'].str.upper().str.strip()
-            df_transformed['country'] = df_transformed['country'].str.upper().str.strip()
-            df_transformed['zip_code'] = df_transformed['zip_code'].str.strip()
-            
-            # Create composite address
-            df_transformed['full_address'] = self._create_full_address(df_transformed)
-            
-            # Generate customer hash for change detection
-            df_transformed['customer_hash'] = df_transformed.apply(
-                lambda row: self._generate_hash(row, ['customer_id', 'email', 'phone']),
-                axis=1
-            )
-            
-            # Calculate customer tenure
-            df_transformed['customer_tenure_days'] = (
-                datetime.now() - pd.to_datetime(df_transformed['registration_date'])
-            ).dt.days
-            
-            # Categorize customer by tenure
-            df_transformed['customer_segment'] = df_transformed['customer_tenure_days'].apply(
-                self._categorize_customer_tenure
-            )
-            
-            # Validate status
-            valid_statuses = self.business_rules.get('valid_customer_statuses', 
-                                                     ['ACTIVE', 'INACTIVE', 'SUSPENDED'])
-            df_transformed['status'] = df_transformed['status'].str.upper()
-            df_transformed['status_valid'] = df_transformed['status'].isin(valid_statuses)
-            
-            # Add transformation metadata
-            df_transformed['transform_timestamp'] = datetime.now()
-            df_transformed['record_version'] = 1
-            
-            logger.info(f"Successfully transformed {len(df_transformed)} customer records")
-            return df_transformed
+            logger.info(f"Created process group: {group_name}")
+            return pg
             
         except Exception as e:
-            logger.error(f"Error transforming customer data: {str(e)}")
+            logger.error(f"Failed to create process group: {str(e)}")
             raise
     
-    def transform_transactions(self, df: pd.DataFrame, 
-                               customer_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def create_partition_record_processor(self, pg_id: str) -> Any:
         """
-        Transform transaction data with enrichment and calculations.
+        Create PartitionRecord processor to group by order_id
         
         Args:
-            df: Raw transaction DataFrame
-            customer_df: Optional customer DataFrame for enrichment
+            pg_id: Process group ID
             
         Returns:
-            Transformed transaction DataFrame
+            Processor entity
         """
         try:
-            logger.info(f"Transforming {len(df)} transaction records")
-            
-            df_transformed = df.copy()
-            
-            # Ensure numeric fields
-            numeric_fields = ['amount', 'tax_amount', 'discount_amount', 'shipping_amount']
-            for field in numeric_fields:
-                if field in df_transformed.columns:
-                    df_transformed[field] = pd.to_numeric(
-                        df_transformed[field], errors='coerce'
-                    ).fillna(0)
-            
-            # Calculate total amount
-            df_transformed['total_amount'] = (
-                df_transformed.get('amount', 0) +
-                df_transformed.get('tax_amount', 0) +
-                df_transformed.get('shipping_amount', 0) -
-                df_transformed.get('discount_amount', 0)
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.PartitionRecord'),
+                location=(200.0, 200.0),
+                name='Partition By Order ID'
             )
             
-            # Standardize transaction type and status
-            df_transformed['transaction_type'] = df_transformed['transaction_type'].str.upper()
-            df_transformed['status'] = df_transformed['status'].str.upper()
+            partition_fields = self.aggregation_config.get('group_by_fields', ['order_id'])
             
-            # Categorize transaction amount
-            df_transformed['amount_category'] = df_transformed['total_amount'].apply(
-                self._categorize_transaction_amount
-            )
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Record Reader': 'JsonTreeReader',
+                'Record Writer': 'JsonRecordSetWriter',
+                'Partition by': ', '.join(partition_fields)
+            }
+            config.auto_terminated_relationships = ['failure']
             
-            # Extract date components
-            df_transformed['transaction_year'] = df_transformed['transaction_date'].dt.year
-            df_transformed['transaction_month'] = df_transformed['transaction_date'].dt.month
-            df_transformed['transaction_day'] = df_transformed['transaction_date'].dt.day
-            df_transformed['transaction_quarter'] = df_transformed['transaction_date'].dt.quarter
-            df_transformed['transaction_day_of_week'] = df_transformed['transaction_date'].dt.dayofweek
-            df_transformed['transaction_week_of_year'] = df_transformed['transaction_date'].dt.isocalendar().week
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured PartitionRecord processor")
             
-            # Flag weekend transactions
-            df_transformed['is_weekend'] = df_transformed['transaction_day_of_week'].isin([5, 6])
-            
-            # Enrich with customer data if provided
-            if customer_df is not None:
-                df_transformed = self._enrich_with_customer_data(df_transformed, customer_df)
-            
-            # Generate transaction hash
-            df_transformed['transaction_hash'] = df_transformed.apply(
-                lambda row: self._generate_hash(
-                    row, ['transaction_id', 'customer_id', 'total_amount']
-                ),
-                axis=1
-            )
-            
-            # Validate business rules
-            df_transformed['amount_valid'] = df_transformed['total_amount'] >= 0
-            df_transformed['date_valid'] = df_transformed['transaction_date'] <= datetime.now()
-            
-            # Add transformation metadata
-            df_transformed['transform_timestamp'] = datetime.now()
-            df_transformed['record_version'] = 1
-            
-            logger.info(f"Successfully transformed {len(df_transformed)} transaction records")
-            return df_transformed
+            return processor
             
         except Exception as e:
-            logger.error(f"Error transforming transaction data: {str(e)}")
+            logger.error(f"Failed to create PartitionRecord processor: {str(e)}")
             raise
     
-    def aggregate_customer_metrics(self, transactions_df: pd.DataFrame) -> pd.DataFrame:
+    def create_query_record_processor(self, pg_id: str) -> Any:
         """
-        Aggregate transaction metrics by customer.
+        Create QueryRecord processor to perform aggregation
         
         Args:
-            transactions_df: Transformed transaction DataFrame
+            pg_id: Process group ID
             
         Returns:
-            DataFrame with customer-level aggregated metrics
+            Processor entity
         """
         try:
-            logger.info("Aggregating customer transaction metrics")
-            
-            metrics = transactions_df.groupby('customer_id').agg({
-                'transaction_id': 'count',
-                'total_amount': ['sum', 'mean', 'max', 'min'],
-                'transaction_date': ['min', 'max']
-            }).reset_index()
-            
-            # Flatten column names
-            metrics.columns = [
-                'customer_id',
-                'total_transactions',
-                'total_spent',
-                'avg_transaction_amount',
-                'max_transaction_amount',
-                'min_transaction_amount',
-                'first_transaction_date',
-                'last_transaction_date'
-            ]
-            
-            # Calculate additional metrics
-            metrics['customer_lifetime_days'] = (
-                metrics['last_transaction_date'] - metrics['first_transaction_date']
-            ).dt.days
-            
-            metrics['avg_days_between_transactions'] = (
-                metrics['customer_lifetime_days'] / metrics['total_transactions']
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.QueryRecord'),
+                location=(200.0, 400.0),
+                name='Aggregate Line Items'
             )
             
-            # Categorize customer value
-            metrics['customer_value_segment'] = pd.qcut(
-                metrics['total_spent'],
-                q=4,
-                labels=['Low', 'Medium', 'High', 'Premium']
-            )
+            # Build aggregation SQL
+            agg_fields = self.aggregation_config.get('aggregation_fields', {})
+            group_by = self.aggregation_config.get('group_by_fields', ['order_id'])
             
-            metrics['aggregation_timestamp'] = datetime.now()
+            select_clauses = []
+            for field in group_by:
+                select_clauses.append(field)
             
-            logger.info(f"Aggregated metrics for {len(metrics)} customers")
-            return metrics
+            for field, agg_type in agg_fields.items():
+                if agg_type == 'SUM':
+                    select_clauses.append(f"SUM({field}) as total_{field}")
+                elif agg_type == 'COUNT':
+                    select_clauses.append(f"COUNT({field}) as count_{field}")
+                elif agg_type == 'AVG':
+                    select_clauses.append(f"AVG({field}) as avg_{field}")
+                elif agg_type == 'MIN':
+                    select_clauses.append(f"MIN({field}) as min_{field}")
+                elif agg_type == 'MAX':
+                    select_clauses.append(f"MAX({field}) as max_{field}")
+            
+            # Add line item count
+            select_clauses.append("COUNT(*) as line_item_count")
+            
+            sql_query = f"""
+            SELECT 
+                {', '.join(select_clauses)}
+            FROM FLOWFILE
+            GROUP BY {', '.join(group_by)}
+            """
+            
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Record Reader': 'JsonTreeReader',
+                'Record Writer': 'JsonRecordSetWriter',
+                'Include Zero Record FlowFiles': 'false',
+                'aggregated': sql_query.strip()
+            }
+            config.auto_terminated_relationships = ['failure']
+            
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured QueryRecord processor")
+            logger.info(f"Aggregation SQL: {sql_query.strip()}")
+            
+            return processor
             
         except Exception as e:
-            logger.error(f"Error aggregating customer metrics: {str(e)}")
+            logger.error(f"Failed to create QueryRecord processor: {str(e)}")
             raise
     
-    def _format_phone(self, phone: str) -> str:
-        """Format phone number to standard format."""
-        if pd.isna(phone):
-            return None
+    def create_update_attribute_processor(self, pg_id: str) -> Any:
+        """
+        Create UpdateAttribute processor to add metadata
         
-        # Remove non-numeric characters
-        digits = ''.join(filter(str.isdigit, str(phone)))
-        
-        # Format as (XXX) XXX-XXXX for 10-digit numbers
-        if len(digits) == 10:
-            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-        
-        return phone
-    
-    def _create_full_address(self, df: pd.DataFrame) -> pd.Series:
-        """Create full address string from components."""
-        address_parts = []
-        
-        for _, row in df.iterrows():
-            parts = [
-                row.get('address_line1', ''),
-                row.get('address_line2', ''),
-                row.get('city', ''),
-                row.get('state', ''),
-                row.get('zip_code', ''),
-                row.get('country', '')
-            ]
+        Args:
+            pg_id: Process group ID
             
-            # Filter out empty parts
-            parts = [str(p).strip() for p in parts if pd.notna(p) and str(p).strip()]
-            address_parts.append(', '.join(parts))
-        
-        return pd.Series(address_parts, index=df.index)
+        Returns:
+            Processor entity
+        """
+        try:
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.attributes.UpdateAttribute'),
+                location=(200.0, 600.0),
+                name='Add Aggregation Metadata'
+            )
+            
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'aggregation.timestamp': '${now():format("yyyy-MM-dd HH:mm:ss")}',
+                'aggregation.type': 'order_level',
+                'aggregation.version': self.aggregation_config.get('version', '1.0'),
+                'record.type': 'aggregated_order'
+            }
+            config.auto_terminated_relationships = []
+            
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured UpdateAttribute processor")
+            
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create UpdateAttribute processor: {str(e)}")
+            raise
     
-    def _generate_hash(self, row: pd.Series, fields: List[str]) -> str:
-        """Generate SHA256 hash from specified fields."""
-        values = '|'.join([str(row.get(f, '')) for f in fields])
-        return sha256(values.encode()).hexdigest()
-    
-    def _categorize_customer_tenure(self, days: int) -> str:
-        """Categorize customer by tenure."""
-        if days < 30:
-            return 'NEW'
-        elif days < 180:
-            return 'RECENT'
-        elif days < 365:
-            return 'ESTABLISHED'
-        else:
-            return 'LOYAL'
-    
-    def _categorize_transaction_amount(self, amount: float) -> str:
-        """Categorize transaction by amount."""
-        thresholds = self.business_rules.get('amount_thresholds', {
-            'small': 50,
-            'medium': 200,
-            'large': 1000
-        })
+    def create_evaluate_json_path_processor(self, pg_id: str) -> Any:
+        """
+        Create EvaluateJsonPath processor to extract aggregated values
         
-        if amount < thresholds['small']:
-            return 'SMALL'
-        elif amount < thresholds['medium']:
-            return 'MEDIUM'
-        elif amount < thresholds['large']:
-            return 'LARGE'
-        else:
-            return 'EXTRA_LARGE'
+        Args:
+            pg_id: Process group ID
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.EvaluateJsonPath'),
+                location=(200.0, 800.0),
+                name='Extract Aggregated Values'
+            )
+            
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Destination': 'flowfile-attribute',
+                'Return Type': 'json',
+                'order_id': '$.order_id',
+                'total_amount': '$.total_amount',
+                'total_quantity': '$.total_quantity',
+                'line_item_count': '$.line_item_count'
+            }
+            config.auto_terminated_relationships = ['failure', 'unmatched']
+            
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured EvaluateJsonPath processor")
+            
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create EvaluateJsonPath processor: {str(e)}")
+            raise
     
-    def _enrich_with_customer_data(self, transactions_df: pd.DataFrame,
-                                   customer_df: pd.DataFrame) -> pd.DataFrame:
-        """Enrich transactions with customer information."""
-        customer_fields = ['customer_id', 'full_name', 'email', 'customer_segment', 'state']
-        customer_subset = customer_df[customer_fields].copy()
+    def create_route_on_content_processor(self, pg_id: str) -> Any:
+        """
+        Create RouteOnContent processor to validate aggregation results
         
-        enriched = transactions_df.merge(
-            customer_subset,
-            on='customer_id',
-            how='left',
-            suffixes=('', '_customer')
-        )
+        Args:
+            pg_id: Process group ID
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.RouteOnContent'),
+                location=(200.0, 1000.0),
+                name='Validate Aggregation'
+            )
+            
+            min_amount = self.aggregation_config.get('validation', {}).get('min_total_amount', 0)
+            
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Match Requirement': 'content must contain match',
+                'Character Set': 'UTF-8',
+                'Content Buffer Size': '1 MB',
+                'valid_aggregation': f'"total_amount"\\s*:\\s*[0-9]+\\.?[0-9]*'
+            }
+            config.auto_terminated_relationships = []
+            
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured RouteOnContent processor")
+            
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create RouteOnContent processor: {str(e)}")
+            raise
+    
+    def create_jolt_transform_processor(self, pg_id: str) -> Any:
+        """
+        Create JoltTransformJSON processor to reshape aggregated data
         
-        return enriched
+        Args:
+            pg_id: Process group ID
+            
+        Returns:
+            Processor entity
+        """
+        try:
+            processor = nipyapi.canvas.create_processor(
+                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
+                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.JoltTransformJSON'),
+                location=(200.0, 1200.0),
+                name='Reshape Aggregated Data'
+            )
+            
+            jolt_spec = {
+                "operation": "shift",
+                "spec": {
+                    "order_id": "order.id",
+                    "customer_id": "order.customer_id",
+                    "total_*": "order.totals.&(0,1)",
+                    "count_*": "order.counts.&(0,1)",
+                    "avg_*": "order.averages.&(0,1)",
+                    "min_*": "order.minimums.&(0,1)",
+                    "max_*": "order.maximums.&(0,1)",
+                    "line_item_count": "order.line_item_count",
+                    "*": "order.&"
+                }
+            }
+            
+            config = ProcessorConfigDTO()
+            config.properties = {
+                'Jolt Transformation DSL': 'jolt-transform-shift',
+                'Jolt Specification': str(jolt_spec)
+            }
+            config.auto_terminated_relationships = ['failure']
+            
+            nipyapi.canvas.update_processor(processor, config)
+            logger.info("Created and configured JoltTransformJSON processor")
+            
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Failed to create JoltTransformJSON processor: {str(e)}")
+            raise
+    
+    def create_aggregation_flow(self, parent_pg_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Create complete aggregation flow for line items
+        
+        Args:
+            parent_pg_id: Parent process group ID (uses root if None)
+            
+        Returns:
+            Dict containing created processors and connections
+        """
+        try:
+            if parent_pg_id is None:
+                parent_pg_id = nipyapi.canvas.get_root_pg_id()
+            
+            # Create process group
+            pg = self.create_process_group(parent_pg_id, 'Line_Item_Aggregation')
+            pg_id = pg.id
+            
+            # Create processors
+            partition_record = self.create_partition_record_processor(pg_id)
+            query_record = self.create_query_record_processor(pg_id)
+            update_attribute = self.create_update_attribute_processor(pg_id)
+            evaluate_json = self.create_evaluate_json_path_processor(pg_id)
+            route_content = self.create_route_on_content_processor(pg_id)
+            jolt_transform = self.create_jolt_transform_processor(pg_id)
+            
+            # Create connections
+            connections = []
+            
+            # PartitionRecord -> QueryRecord
+            conn1 = nipyapi.canvas.create_connection(
+                source=partition_record,
+                target=query_record,
+                relationships=['success']
+            )
+            connections.append(conn1)
+            
+            # QueryRecord -> UpdateAttribute
+            conn2 = nipyapi.canvas.create_connection(
+                source=query_record,
+                target=update_attribute,
+                relationships=['aggregated']
+            )
+            connections.append(conn2)
+            
+            # UpdateAttribute -> EvaluateJsonPath
+            conn3 = nipyapi.canvas.create_connection(
+                source=update_attribute,
+                target=evaluate_json,
+                relationships=['success']
+            )
+            connections.append(conn3)
+            
+            # EvaluateJsonPath -> RouteOnContent
+            conn4 = nipyapi.canvas.create_connection(
+                source=evaluate_json,
+                target=route_content,
+                relationships=['matched']
+            )
+            connections.append(conn4)
+            
+            # RouteOnContent -> JoltTransform
+            conn5 = nipyapi.canvas.create_connection(
+                source=route_content,
+                target=jolt_transform,
+                relationships=['valid_aggregation']
+            )
+            connections.append(conn5)
+            
+            logger.info("Successfully created aggregation flow")
+            
+            return {
+                'process_group': pg,
+                'processors': {
+                    'partition_record': partition_record,
+                    'query_record': query_record,
+                    'update_attribute': update_attribute,
+                    'evaluate_json': evaluate_json,
+                    'route_content': route_content,
+                    'jolt_transform': jolt_transform
+                },
+                'connections': connections
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to create aggregation flow: {str(e)}")
+            raise
+    
+    def start_aggregation_flow(self, pg_id: str) -> bool:
+        """
+        Start all processors in the aggregation flow
+        
+        Args:
+            pg_id: Process group ID
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
+            nipyapi.canvas.schedule_process_group(pg.id, True)
+            logger.info(f"Started aggregation flow in process group: {pg_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start aggregation flow: {str(e)}")
+            raise
+    
+    def stop_aggregation_flow(self, pg_id: str) -> bool:
+        """
+        Stop all processors in the aggregation flow
+        
+        Args:
+            pg_id: Process group ID
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
+            nipyapi.canvas.schedule_process_group(pg.id, False)
+            logger.info(f"Stopped aggregation flow in process group: {pg_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to stop aggregation flow: {str(e)}")
+            raise
+
+
+def main():
+    """Main execution function"""
+    try:
+        aggregator = LineItemAggregator()
+        
+        # Create aggregation flow
+        flow = aggregator.create_aggregation_flow()
+        
+        logger.info("Line item aggregation flow created successfully")
+        logger.info(f"Process Group ID: {flow['process_group'].id}")
+        
+    except Exception as e:
+        logger.error(f"Failed to create aggregation flow: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
