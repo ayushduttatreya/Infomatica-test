@@ -1,0 +1,166 @@
+# Forecast ID Validation Configuration
+
+# NiFi Configuration
+nifi:
+  url: "http://localhost:8080/nifi-api"
+  process_group_name: "Forecast_ID_Validation"
+  
+  # Connection settings
+  connection:
+    timeout: 30
+    retry_attempts: 3
+    retry_delay: 5
+  
+  # Processor settings
+  processor:
+    concurrent_tasks: 4
+    scheduling_period: "0 sec"
+    scheduling_strategy: "TIMER_DRIVEN"
+    execution_node: "ALL"
+
+# Validation Configuration
+validation:
+  # Format validation
+  format:
+    pattern: "^[A-Z]{3}-[0-9]{6}-[A-Z]{2}$"
+    description: "3 uppercase letters, dash, 6 digits, dash, 2 uppercase letters"
+  
+  # Valid region codes (prefix)
+  valid_region_codes:
+    - "NAM"  # North America
+    - "EUR"  # Europe
+    - "APJ"  # Asia Pacific Japan
+    - "LAM"  # Latin America
+    - "MEA"  # Middle East Africa
+    - "CHN"  # China
+    - "IND"  # India
+    - "AUS"  # Australia
+  
+  # Valid forecast types (suffix)
+  valid_forecast_types:
+    - "QT"  # Quarterly
+    - "MO"  # Monthly
+    - "WK"  # Weekly
+    - "AN"  # Annual
+    - "AD"  # Ad-hoc
+  
+  # Sequence number range
+  min_sequence_number: 1
+  max_sequence_number: 999999
+  
+  # Validation flags
+  enable_uniqueness_check: true
+  enable_business_rules: true
+  enable_format_check: true
+  
+  # Error handling
+  error_handling:
+    fail_on_first_error: false
+    max_errors_per_batch: 1000
+    log_invalid_records: true
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  handlers:
+    console:
+      enabled: true
+      level: "INFO"
+    
+    file:
+      enabled: true
+      level: "DEBUG"
+      path: "logs/forecast_validation.log"
+      max_bytes: 10485760  # 10MB
+      backup_count: 5
+    
+    error_file:
+      enabled: true
+      level: "ERROR"
+      path: "logs/forecast_validation_errors.log"
+      max_bytes: 10485760
+      backup_count: 5
+
+# Output Configuration
+output:
+  # Valid records output
+  valid_records:
+    path: "output/valid_forecasts"
+    format: "json"
+    include_validation_metadata: true
+  
+  # Invalid records output
+  invalid_records:
+    path: "output/invalid_forecasts"
+    format: "json"
+    include_validation_metadata: true
+    include_error_details: true
+  
+  # Statistics output
+  statistics:
+    enabled: true
+    path: "output/validation_stats.json"
+    include_timestamp: true
+
+# Performance Configuration
+performance:
+  batch_size: 1000
+  max_concurrent_batches: 4
+  memory_limit_mb: 2048
+  
+  # Caching
+  cache:
+    enabled: true
+    max_size: 10000
+    ttl_seconds: 3600
+
+# Monitoring Configuration
+monitoring:
+  enabled: true
+  
+  metrics:
+    - "total_records_processed"
+    - "valid_records_count"
+    - "invalid_records_count"
+    - "duplicate_records_count"
+    - "format_errors_count"
+    - "business_rule_errors_count"
+    - "processing_time_seconds"
+    - "throughput_records_per_second"
+  
+  alerts:
+    enabled: true
+    
+    thresholds:
+      error_rate_percent: 10
+      duplicate_rate_percent: 5
+      processing_time_seconds: 300
+    
+    notification:
+      email:
+        enabled: false
+        recipients: []
+      
+      webhook:
+        enabled: false
+        url: ""
+
+# Data Quality Rules
+data_quality:
+  # Additional validation rules
+  rules:
+    - name: "check_region_sequence_alignment"
+      description: "Verify region code aligns with sequence number ranges"
+      enabled: true
+      
+    - name: "check_forecast_type_consistency"
+      description: "Validate forecast type matches expected patterns"
+      enabled: true
+  
+  # Quarantine settings
+  quarantine:
+    enabled: true
+    path: "quarantine/forecast_ids"
+    retention_days: 30
