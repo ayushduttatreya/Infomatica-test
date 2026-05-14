@@ -1,13 +1,11 @@
 """
-Extract module for customer address management data from source systems.
-Handles extraction of customer and address data with error handling and validation.
+Extract module for customer address pipeline.
+Handles reading customer and address data from source files.
 """
-
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any, List
 import pandas as pd
 from pathlib import Path
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -15,45 +13,37 @@ logger = logging.getLogger(__name__)
 class CustomerAddressExtractor:
     """Extracts customer and address data from source files."""
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the extractor with configuration.
+        Initialize extractor with configuration.
         
         Args:
-            config_path: Path to configuration file
+            config: Configuration dictionary containing source paths and settings
         """
-        self.config = self._load_config(config_path)
-        self.source_config = self.config.get('source', {})
+        self.config = config
+        self.source_config = config.get('source', {})
         
-    def _load_config(self, config_path: str) -> Dict[str, Any]:
-        """Load configuration from YAML file."""
-        try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except Exception as e:
-            logger.error(f"Failed to load config from {config_path}: {e}")
-            raise
-    
-    def extract_customers(self, file_path: Optional[str] = None) -> pd.DataFrame:
+    def extract_customers(self) -> pd.DataFrame:
         """
-        Extract customer master data from source file.
+        Extract customer data from source file.
         
-        Args:
-            file_path: Optional override for source file path
-            
         Returns:
-            DataFrame containing customer data
-        """
-        source_path = file_path or self.source_config.get('customers_file')
-        
-        if not source_path:
-            raise ValueError("Customer source file path not configured")
-        
-        try:
-            logger.info(f"Extracting customer data from {source_path}")
+            DataFrame containing customer records
             
-            # Define expected schema based on Informatica source definition
-            dtype_mapping = {
+        Raises:
+            FileNotFoundError: If source file does not exist
+            ValueError: If required columns are missing
+        """
+        source_path = Path(self.source_config.get('customers_path'))
+        
+        if not source_path.exists():
+            raise FileNotFoundError(f"Customer source file not found: {source_path}")
+            
+        logger.info(f"Extracting customers from {source_path}")
+        
+        df = pd.read_csv(
+            source_path,
+            dtype={
                 'customer_id': str,
                 'first_name': str,
                 'last_name': str,
@@ -66,84 +56,70 @@ class CustomerAddressExtractor:
                 'zip_code': str,
                 'country': str,
                 'status': str
-            }
-            
-            df = pd.read_csv(
-                source_path,
-                dtype=dtype_mapping,
-                parse_dates=['registration_date'],
-                na_values=['', 'NULL', 'null']
-            )
-            
-            # Validate required fields
-            if df['customer_id'].isnull().any():
-                raise ValueError("customer_id cannot be null (NOT NULL constraint)")
-            
-            logger.info(f"Successfully extracted {len(df)} customer records")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Failed to extract customer data: {e}")
-            raise
-    
-    def extract_addresses(self, file_path: Optional[str] = None) -> pd.DataFrame:
-        """
-        Extract customer address data from source file.
+            },
+            parse_dates=['registration_date']
+        )
         
-        Args:
-            file_path: Optional override for source file path
+        required_columns = ['customer_id', 'first_name', 'last_name', 'email']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
             
+        logger.info(f"Extracted {len(df)} customer records")
+        return df
+        
+    def extract_addresses(self) -> pd.DataFrame:
+        """
+        Extract address data from source file.
+        
         Returns:
-            DataFrame containing address data
-        """
-        source_path = file_path or self.source_config.get('addresses_file')
-        
-        if not source_path:
-            raise ValueError("Address source file path not configured")
-        
-        try:
-            logger.info(f"Extracting address data from {source_path}")
+            DataFrame containing address records
             
-            # Define expected schema
-            dtype_mapping = {
+        Raises:
+            FileNotFoundError: If source file does not exist
+            ValueError: If required columns are missing
+        """
+        source_path = Path(self.source_config.get('addresses_path'))
+        
+        if not source_path.exists():
+            raise FileNotFoundError(f"Address source file not found: {source_path}")
+            
+        logger.info(f"Extracting addresses from {source_path}")
+        
+        df = pd.read_csv(
+            source_path,
+            dtype={
                 'address_id': str,
                 'customer_id': str,
                 'address_type': str,
-                'address_line1': str,
-                'address_line2': str,
+                'street_address': str,
+                'street_address2': str,
                 'city': str,
-                'state': str,
-                'zip_code': str,
-                'country': str,
+                'state_province': str,
+                'postal_code': str,
+                'country_code': str,
                 'is_primary': str,
                 'is_active': str
-            }
+            },
+            parse_dates=['created_date', 'modified_date']
+        )
+        
+        required_columns = ['address_id', 'customer_id', 'street_address', 'city']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
             
-            df = pd.read_csv(
-                source_path,
-                dtype=dtype_mapping,
-                na_values=['', 'NULL', 'null']
-            )
-            
-            # Validate required fields
-            required_fields = ['address_id', 'customer_id']
-            for field in required_fields:
-                if df[field].isnull().any():
-                    raise ValueError(f"{field} cannot be null (NOT NULL constraint)")
-            
-            logger.info(f"Successfully extracted {len(df)} address records")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Failed to extract address data: {e}")
-            raise
-    
+        logger.info(f"Extracted {len(df)} address records")
+        return df
+        
     def extract_all(self) -> Dict[str, pd.DataFrame]:
         """
         Extract all source data.
         
         Returns:
-            Dictionary containing all extracted DataFrames
+            Dictionary containing customers and addresses DataFrames
         """
         return {
             'customers': self.extract_customers(),
