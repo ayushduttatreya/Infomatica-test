@@ -1,49 +1,42 @@
 """
-Extract module for customer transaction loading pipeline.
-Handles data extraction from source systems with error handling and validation.
+Extract module for Sales Order Data Quality Checks
+Reads sales order data from source systems
 """
-
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
+from typing import Dict, Any, List
 import pandas as pd
 from pathlib import Path
+import yaml
 
 logger = logging.getLogger(__name__)
 
 
-class DataExtractor:
-    """Extracts customer and transaction data from source files."""
+class SalesOrderExtractor:
+    """Extracts sales order data from source files"""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the data extractor.
+        Initialize extractor with configuration
         
         Args:
-            config: Configuration dictionary containing source paths and settings
+            config: Configuration dictionary containing source settings
         """
         self.config = config
         self.source_config = config.get('source', {})
-        self.batch_size = config.get('processing', {}).get('batch_size', 10000)
         
     def extract_customers(self, file_path: str) -> pd.DataFrame:
         """
-        Extract customer data from source file.
+        Extract customer data from source file
         
         Args:
             file_path: Path to customer source file
             
         Returns:
             DataFrame containing customer data
-            
-        Raises:
-            FileNotFoundError: If source file doesn't exist
-            ValueError: If data validation fails
         """
         try:
             logger.info(f"Extracting customer data from {file_path}")
             
-            # Read customer data
             df = pd.read_csv(
                 file_path,
                 dtype={
@@ -63,123 +56,85 @@ class DataExtractor:
                 parse_dates=['registration_date']
             )
             
-            # Validate required fields
-            required_fields = ['customer_id', 'first_name', 'last_name', 'email']
-            missing_fields = [f for f in required_fields if f not in df.columns]
-            if missing_fields:
-                raise ValueError(f"Missing required fields: {missing_fields}")
-            
-            # Add extraction metadata
-            df['extract_timestamp'] = datetime.now()
-            df['source_file'] = Path(file_path).name
-            
             logger.info(f"Extracted {len(df)} customer records")
             return df
             
-        except FileNotFoundError:
-            logger.error(f"Customer source file not found: {file_path}")
-            raise
         except Exception as e:
             logger.error(f"Error extracting customer data: {str(e)}")
             raise
     
-    def extract_addresses(self, file_path: str) -> pd.DataFrame:
+    def extract_sales_orders(self, file_path: str) -> pd.DataFrame:
         """
-        Extract customer address data from source file.
+        Extract sales order data from source file
         
         Args:
-            file_path: Path to address source file
+            file_path: Path to sales order source file
             
         Returns:
-            DataFrame containing address data
+            DataFrame containing sales order data
         """
         try:
-            logger.info(f"Extracting address data from {file_path}")
+            logger.info(f"Extracting sales order data from {file_path}")
             
             df = pd.read_csv(
                 file_path,
                 dtype={
-                    'address_id': str,
+                    'order_id': str,
                     'customer_id': str,
-                    'address_type': str
+                    'order_status': str,
+                    'payment_method': str,
+                    'shipping_method': str,
+                    'currency': str
+                },
+                parse_dates=['order_date', 'ship_date', 'delivery_date']
+            )
+            
+            # Convert numeric fields
+            numeric_fields = ['order_amount', 'tax_amount', 'shipping_cost', 'discount_amount', 'total_amount']
+            for field in numeric_fields:
+                if field in df.columns:
+                    df[field] = pd.to_numeric(df[field], errors='coerce')
+            
+            logger.info(f"Extracted {len(df)} sales order records")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error extracting sales order data: {str(e)}")
+            raise
+    
+    def extract_order_line_items(self, file_path: str) -> pd.DataFrame:
+        """
+        Extract order line item data from source file
+        
+        Args:
+            file_path: Path to order line items source file
+            
+        Returns:
+            DataFrame containing order line item data
+        """
+        try:
+            logger.info(f"Extracting order line items from {file_path}")
+            
+            df = pd.read_csv(
+                file_path,
+                dtype={
+                    'line_item_id': str,
+                    'order_id': str,
+                    'product_id': str,
+                    'product_name': str,
+                    'sku': str
                 }
             )
             
-            # Validate required fields
-            required_fields = ['address_id', 'customer_id', 'address_type']
-            missing_fields = [f for f in required_fields if f not in df.columns]
-            if missing_fields:
-                raise ValueError(f"Missing required fields: {missing_fields}")
+            # Convert numeric fields
+            numeric_fields = ['quantity', 'unit_price', 'discount_percent', 'line_total']
+            for field in numeric_fields:
+                if field in df.columns:
+                    df[field] = pd.to_numeric(df[field], errors='coerce')
             
-            df['extract_timestamp'] = datetime.now()
-            df['source_file'] = Path(file_path).name
-            
-            logger.info(f"Extracted {len(df)} address records")
+            logger.info(f"Extracted {len(df)} order line item records")
             return df
             
         except Exception as e:
-            logger.error(f"Error extracting address data: {str(e)}")
+            logger.error(f"Error extracting order line items: {str(e)}")
             raise
-    
-    def extract_transactions(self, file_path: str) -> pd.DataFrame:
-        """
-        Extract transaction data from source file with batch processing support.
-        
-        Args:
-            file_path: Path to transaction source file
-            
-        Returns:
-            DataFrame containing transaction data
-        """
-        try:
-            logger.info(f"Extracting transaction data from {file_path}")
-            
-            # Read in chunks for large files
-            chunks = []
-            for chunk in pd.read_csv(
-                file_path,
-                dtype={
-                    'transaction_id': str,
-                    'customer_id': str,
-                    'transaction_type': str,
-                    'status': str,
-                    'payment_method': str,
-                    'currency': str
-                },
-                parse_dates=['transaction_date'],
-                chunksize=self.batch_size
-            ):
-                chunk['extract_timestamp'] = datetime.now()
-                chunk['source_file'] = Path(file_path).name
-                chunks.append(chunk)
-            
-            df = pd.concat(chunks, ignore_index=True)
-            
-            logger.info(f"Extracted {len(df)} transaction records")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error extracting transaction data: {str(e)}")
-            raise
-    
-    def validate_data_quality(self, df: pd.DataFrame, entity_type: str) -> Dict:
-        """
-        Validate data quality metrics.
-        
-        Args:
-            df: DataFrame to validate
-            entity_type: Type of entity (customer, address, transaction)
-            
-        Returns:
-            Dictionary containing validation metrics
-        """
-        metrics = {
-            'total_records': len(df),
-            'null_counts': df.isnull().sum().to_dict(),
-            'duplicate_count': df.duplicated().sum(),
-            'entity_type': entity_type,
-            'validation_timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Data quality metrics for {entity_type}: {metrics}")
-        return metrics
