@@ -1,468 +1,346 @@
 """
-Transform module for Line Item Aggregation Logic
-Aggregates line items to order level with grouping and summation
+Forecast ID Validation Transform Module
+
+This module implements validation logic for forecast IDs based on Informatica
+mapping specifications. It validates format, uniqueness, and business rules.
 """
 
+import re
 import logging
-from typing import Dict, List, Any, Optional
-from decimal import Decimal
-import nipyapi
-from nipyapi.nifi import ProcessorConfigDTO
-import yaml
+from typing import Dict, List, Set, Optional, Tuple
+from datetime import datetime
+from dataclasses import dataclass, field
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class LineItemAggregator:
-    """Aggregates line items to order level"""
-    
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initialize the aggregator with configuration
-        
-        Args:
-            config_path: Path to configuration file
-        """
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        
-        self.nifi_config = self.config['nifi']
-        self.aggregation_config = self.config['aggregation']
-        
-    def create_process_group(self, parent_pg_id: str, group_name: str) -> Any:
-        """
-        Create a process group for line item aggregation
-        
-        Args:
-            parent_pg_id: Parent process group ID
-            group_name: Name for the new process group
-            
-        Returns:
-            ProcessGroupEntity: Created process group
-        """
-        try:
-            pg = nipyapi.canvas.create_process_group(
-                parent_pg=nipyapi.canvas.get_process_group(parent_pg_id, 'id'),
-                new_pg_name=group_name,
-                location=(800.0, 400.0)
-            )
-            logger.info(f"Created process group: {group_name}")
-            return pg
-            
-        except Exception as e:
-            logger.error(f"Failed to create process group: {str(e)}")
-            raise
-    
-    def create_partition_record_processor(self, pg_id: str) -> Any:
-        """
-        Create PartitionRecord processor to group by order_id
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.PartitionRecord'),
-                location=(200.0, 200.0),
-                name='Partition By Order ID'
-            )
-            
-            partition_fields = self.aggregation_config.get('group_by_fields', ['order_id'])
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'JsonTreeReader',
-                'Record Writer': 'JsonRecordSetWriter',
-                'Partition by': ', '.join(partition_fields)
-            }
-            config.auto_terminated_relationships = ['failure']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured PartitionRecord processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create PartitionRecord processor: {str(e)}")
-            raise
-    
-    def create_query_record_processor(self, pg_id: str) -> Any:
-        """
-        Create QueryRecord processor to perform aggregation
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.QueryRecord'),
-                location=(200.0, 400.0),
-                name='Aggregate Line Items'
-            )
-            
-            # Build aggregation SQL
-            agg_fields = self.aggregation_config.get('aggregation_fields', {})
-            group_by = self.aggregation_config.get('group_by_fields', ['order_id'])
-            
-            select_clauses = []
-            for field in group_by:
-                select_clauses.append(field)
-            
-            for field, agg_type in agg_fields.items():
-                if agg_type == 'SUM':
-                    select_clauses.append(f"SUM({field}) as total_{field}")
-                elif agg_type == 'COUNT':
-                    select_clauses.append(f"COUNT({field}) as count_{field}")
-                elif agg_type == 'AVG':
-                    select_clauses.append(f"AVG({field}) as avg_{field}")
-                elif agg_type == 'MIN':
-                    select_clauses.append(f"MIN({field}) as min_{field}")
-                elif agg_type == 'MAX':
-                    select_clauses.append(f"MAX({field}) as max_{field}")
-            
-            # Add line item count
-            select_clauses.append("COUNT(*) as line_item_count")
-            
-            sql_query = f"""
-            SELECT 
-                {', '.join(select_clauses)}
-            FROM FLOWFILE
-            GROUP BY {', '.join(group_by)}
-            """
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'JsonTreeReader',
-                'Record Writer': 'JsonRecordSetWriter',
-                'Include Zero Record FlowFiles': 'false',
-                'aggregated': sql_query.strip()
-            }
-            config.auto_terminated_relationships = ['failure']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured QueryRecord processor")
-            logger.info(f"Aggregation SQL: {sql_query.strip()}")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create QueryRecord processor: {str(e)}")
-            raise
-    
-    def create_update_attribute_processor(self, pg_id: str) -> Any:
-        """
-        Create UpdateAttribute processor to add metadata
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.attributes.UpdateAttribute'),
-                location=(200.0, 600.0),
-                name='Add Aggregation Metadata'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'aggregation.timestamp': '${now():format("yyyy-MM-dd HH:mm:ss")}',
-                'aggregation.type': 'order_level',
-                'aggregation.version': self.aggregation_config.get('version', '1.0'),
-                'record.type': 'aggregated_order'
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured UpdateAttribute processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create UpdateAttribute processor: {str(e)}")
-            raise
-    
-    def create_evaluate_json_path_processor(self, pg_id: str) -> Any:
-        """
-        Create EvaluateJsonPath processor to extract aggregated values
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.EvaluateJsonPath'),
-                location=(200.0, 800.0),
-                name='Extract Aggregated Values'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Destination': 'flowfile-attribute',
-                'Return Type': 'json',
-                'order_id': '$.order_id',
-                'total_amount': '$.total_amount',
-                'total_quantity': '$.total_quantity',
-                'line_item_count': '$.line_item_count'
-            }
-            config.auto_terminated_relationships = ['failure', 'unmatched']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured EvaluateJsonPath processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create EvaluateJsonPath processor: {str(e)}")
-            raise
-    
-    def create_route_on_content_processor(self, pg_id: str) -> Any:
-        """
-        Create RouteOnContent processor to validate aggregation results
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.RouteOnContent'),
-                location=(200.0, 1000.0),
-                name='Validate Aggregation'
-            )
-            
-            min_amount = self.aggregation_config.get('validation', {}).get('min_total_amount', 0)
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Match Requirement': 'content must contain match',
-                'Character Set': 'UTF-8',
-                'Content Buffer Size': '1 MB',
-                'valid_aggregation': f'"total_amount"\\s*:\\s*[0-9]+\\.?[0-9]*'
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured RouteOnContent processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create RouteOnContent processor: {str(e)}")
-            raise
-    
-    def create_jolt_transform_processor(self, pg_id: str) -> Any:
-        """
-        Create JoltTransformJSON processor to reshape aggregated data
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=nipyapi.canvas.get_process_group(pg_id, 'id'),
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.JoltTransformJSON'),
-                location=(200.0, 1200.0),
-                name='Reshape Aggregated Data'
-            )
-            
-            jolt_spec = {
-                "operation": "shift",
-                "spec": {
-                    "order_id": "order.id",
-                    "customer_id": "order.customer_id",
-                    "total_*": "order.totals.&(0,1)",
-                    "count_*": "order.counts.&(0,1)",
-                    "avg_*": "order.averages.&(0,1)",
-                    "min_*": "order.minimums.&(0,1)",
-                    "max_*": "order.maximums.&(0,1)",
-                    "line_item_count": "order.line_item_count",
-                    "*": "order.&"
-                }
-            }
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Jolt Transformation DSL': 'jolt-transform-shift',
-                'Jolt Specification': str(jolt_spec)
-            }
-            config.auto_terminated_relationships = ['failure']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            logger.info("Created and configured JoltTransformJSON processor")
-            
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create JoltTransformJSON processor: {str(e)}")
-            raise
-    
-    def create_aggregation_flow(self, parent_pg_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Create complete aggregation flow for line items
-        
-        Args:
-            parent_pg_id: Parent process group ID (uses root if None)
-            
-        Returns:
-            Dict containing created processors and connections
-        """
-        try:
-            if parent_pg_id is None:
-                parent_pg_id = nipyapi.canvas.get_root_pg_id()
-            
-            # Create process group
-            pg = self.create_process_group(parent_pg_id, 'Line_Item_Aggregation')
-            pg_id = pg.id
-            
-            # Create processors
-            partition_record = self.create_partition_record_processor(pg_id)
-            query_record = self.create_query_record_processor(pg_id)
-            update_attribute = self.create_update_attribute_processor(pg_id)
-            evaluate_json = self.create_evaluate_json_path_processor(pg_id)
-            route_content = self.create_route_on_content_processor(pg_id)
-            jolt_transform = self.create_jolt_transform_processor(pg_id)
-            
-            # Create connections
-            connections = []
-            
-            # PartitionRecord -> QueryRecord
-            conn1 = nipyapi.canvas.create_connection(
-                source=partition_record,
-                target=query_record,
-                relationships=['success']
-            )
-            connections.append(conn1)
-            
-            # QueryRecord -> UpdateAttribute
-            conn2 = nipyapi.canvas.create_connection(
-                source=query_record,
-                target=update_attribute,
-                relationships=['aggregated']
-            )
-            connections.append(conn2)
-            
-            # UpdateAttribute -> EvaluateJsonPath
-            conn3 = nipyapi.canvas.create_connection(
-                source=update_attribute,
-                target=evaluate_json,
-                relationships=['success']
-            )
-            connections.append(conn3)
-            
-            # EvaluateJsonPath -> RouteOnContent
-            conn4 = nipyapi.canvas.create_connection(
-                source=evaluate_json,
-                target=route_content,
-                relationships=['matched']
-            )
-            connections.append(conn4)
-            
-            # RouteOnContent -> JoltTransform
-            conn5 = nipyapi.canvas.create_connection(
-                source=route_content,
-                target=jolt_transform,
-                relationships=['valid_aggregation']
-            )
-            connections.append(conn5)
-            
-            logger.info("Successfully created aggregation flow")
-            
-            return {
-                'process_group': pg,
-                'processors': {
-                    'partition_record': partition_record,
-                    'query_record': query_record,
-                    'update_attribute': update_attribute,
-                    'evaluate_json': evaluate_json,
-                    'route_content': route_content,
-                    'jolt_transform': jolt_transform
-                },
-                'connections': connections
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to create aggregation flow: {str(e)}")
-            raise
-    
-    def start_aggregation_flow(self, pg_id: str) -> bool:
-        """
-        Start all processors in the aggregation flow
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
-            nipyapi.canvas.schedule_process_group(pg.id, True)
-            logger.info(f"Started aggregation flow in process group: {pg_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to start aggregation flow: {str(e)}")
-            raise
-    
-    def stop_aggregation_flow(self, pg_id: str) -> bool:
-        """
-        Stop all processors in the aggregation flow
-        
-        Args:
-            pg_id: Process group ID
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            pg = nipyapi.canvas.get_process_group(pg_id, 'id')
-            nipyapi.canvas.schedule_process_group(pg.id, False)
-            logger.info(f"Stopped aggregation flow in process group: {pg_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to stop aggregation flow: {str(e)}")
-            raise
+@dataclass
+class ValidationResult:
+    """Container for validation results"""
+    is_valid: bool
+    forecast_id: str
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    metadata: Dict = field(default_factory=dict)
 
 
-def main():
-    """Main execution function"""
-    try:
-        aggregator = LineItemAggregator()
-        
-        # Create aggregation flow
-        flow = aggregator.create_aggregation_flow()
-        
-        logger.info("Line item aggregation flow created successfully")
-        logger.info(f"Process Group ID: {flow['process_group'].id}")
-        
-    except Exception as e:
-        logger.error(f"Failed to create aggregation flow: {str(e)}")
-        raise
+@dataclass
+class ValidationStats:
+    """Statistics for validation operations"""
+    total_records: int = 0
+    valid_records: int = 0
+    invalid_records: int = 0
+    duplicate_records: int = 0
+    format_errors: int = 0
+    business_rule_errors: int = 0
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
 
 
-if __name__ == "__main__":
-    main()
+class ForecastIDValidator:
+    """
+    Validates forecast IDs according to business rules and format specifications.
+    
+    Validation Rules:
+    1. Format: Must match pattern [A-Z]{3}-[0-9]{6}-[A-Z]{2}
+    2. Uniqueness: No duplicate IDs within batch
+    3. Business Rules:
+       - Prefix must be valid region code
+       - Numeric portion must be within valid range
+       - Suffix must be valid forecast type
+    """
+    
+    # Format pattern: 3 uppercase letters, dash, 6 digits, dash, 2 uppercase letters
+    FORECAST_ID_PATTERN = re.compile(r'^[A-Z]{3}-[0-9]{6}-[A-Z]{2}$')
+    
+    def __init__(self, config: Dict):
+        """
+        Initialize validator with configuration.
+        
+        Args:
+            config: Configuration dictionary containing validation parameters
+        """
+        self.config = config
+        self.valid_region_codes = set(config.get('valid_region_codes', []))
+        self.valid_forecast_types = set(config.get('valid_forecast_types', []))
+        self.min_sequence = config.get('min_sequence_number', 1)
+        self.max_sequence = config.get('max_sequence_number', 999999)
+        self.enable_uniqueness_check = config.get('enable_uniqueness_check', True)
+        self.enable_business_rules = config.get('enable_business_rules', True)
+        
+        # Track seen IDs for uniqueness validation
+        self.seen_ids: Set[str] = set()
+        self.stats = ValidationStats(start_time=datetime.now())
+        
+        logger.info(f"Initialized ForecastIDValidator with config: {config}")
+    
+    def validate_format(self, forecast_id: str) -> Tuple[bool, List[str]]:
+        """
+        Validate forecast ID format.
+        
+        Args:
+            forecast_id: The forecast ID to validate
+            
+        Returns:
+            Tuple of (is_valid, error_messages)
+        """
+        errors = []
+        
+        if not forecast_id:
+            errors.append("Forecast ID is empty or null")
+            return False, errors
+        
+        if not isinstance(forecast_id, str):
+            errors.append(f"Forecast ID must be string, got {type(forecast_id)}")
+            return False, errors
+        
+        # Check length first for better error messages
+        if len(forecast_id) != 14:
+            errors.append(
+                f"Forecast ID length must be 14 characters, got {len(forecast_id)}"
+            )
+            return False, errors
+        
+        # Check pattern
+        if not self.FORECAST_ID_PATTERN.match(forecast_id):
+            errors.append(
+                f"Forecast ID format invalid. Expected: XXX-NNNNNN-XX "
+                f"(3 letters, dash, 6 digits, dash, 2 letters)"
+            )
+            return False, errors
+        
+        return True, errors
+    
+    def validate_business_rules(self, forecast_id: str) -> Tuple[bool, List[str], List[str]]:
+        """
+        Validate business rules for forecast ID.
+        
+        Args:
+            forecast_id: The forecast ID to validate
+            
+        Returns:
+            Tuple of (is_valid, error_messages, warning_messages)
+        """
+        errors = []
+        warnings = []
+        
+        if not self.enable_business_rules:
+            return True, errors, warnings
+        
+        # Parse components
+        parts = forecast_id.split('-')
+        region_code = parts[0]
+        sequence_str = parts[1]
+        forecast_type = parts[2]
+        
+        # Validate region code
+        if self.valid_region_codes and region_code not in self.valid_region_codes:
+            errors.append(
+                f"Invalid region code '{region_code}'. "
+                f"Valid codes: {sorted(self.valid_region_codes)}"
+            )
+        
+        # Validate sequence number range
+        sequence_num = int(sequence_str)
+        if sequence_num < self.min_sequence or sequence_num > self.max_sequence:
+            errors.append(
+                f"Sequence number {sequence_num} out of valid range "
+                f"[{self.min_sequence}, {self.max_sequence}]"
+            )
+        
+        # Validate forecast type
+        if self.valid_forecast_types and forecast_type not in self.valid_forecast_types:
+            errors.append(
+                f"Invalid forecast type '{forecast_type}'. "
+                f"Valid types: {sorted(self.valid_forecast_types)}"
+            )
+        
+        # Warning for sequence numbers near limits
+        if sequence_num > self.max_sequence * 0.95:
+            warnings.append(
+                f"Sequence number {sequence_num} is near maximum limit"
+            )
+        
+        is_valid = len(errors) == 0
+        return is_valid, errors, warnings
+    
+    def check_uniqueness(self, forecast_id: str) -> Tuple[bool, List[str]]:
+        """
+        Check if forecast ID is unique within the batch.
+        
+        Args:
+            forecast_id: The forecast ID to check
+            
+        Returns:
+            Tuple of (is_unique, error_messages)
+        """
+        errors = []
+        
+        if not self.enable_uniqueness_check:
+            return True, errors
+        
+        if forecast_id in self.seen_ids:
+            errors.append(f"Duplicate forecast ID detected: {forecast_id}")
+            self.stats.duplicate_records += 1
+            return False, errors
+        
+        self.seen_ids.add(forecast_id)
+        return True, errors
+    
+    def validate(self, record: Dict) -> ValidationResult:
+        """
+        Perform complete validation on a record.
+        
+        Args:
+            record: Dictionary containing forecast data with 'forecast_id' key
+            
+        Returns:
+            ValidationResult object with validation outcome
+        """
+        self.stats.total_records += 1
+        
+        forecast_id = record.get('forecast_id', '').strip()
+        
+        result = ValidationResult(
+            is_valid=True,
+            forecast_id=forecast_id,
+            metadata={
+                'record_number': self.stats.total_records,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+        
+        # Format validation
+        format_valid, format_errors = self.validate_format(forecast_id)
+        if not format_valid:
+            result.is_valid = False
+            result.errors.extend(format_errors)
+            self.stats.format_errors += 1
+            self.stats.invalid_records += 1
+            return result
+        
+        # Business rules validation
+        rules_valid, rules_errors, rules_warnings = self.validate_business_rules(forecast_id)
+        if not rules_valid:
+            result.is_valid = False
+            result.errors.extend(rules_errors)
+            self.stats.business_rule_errors += 1
+        
+        result.warnings.extend(rules_warnings)
+        
+        # Uniqueness check
+        unique_valid, unique_errors = self.check_uniqueness(forecast_id)
+        if not unique_valid:
+            result.is_valid = False
+            result.errors.extend(unique_errors)
+        
+        # Update statistics
+        if result.is_valid:
+            self.stats.valid_records += 1
+        else:
+            self.stats.invalid_records += 1
+        
+        return result
+    
+    def validate_batch(self, records: List[Dict]) -> List[ValidationResult]:
+        """
+        Validate a batch of records.
+        
+        Args:
+            records: List of record dictionaries
+            
+        Returns:
+            List of ValidationResult objects
+        """
+        logger.info(f"Starting batch validation of {len(records)} records")
+        results = []
+        
+        for record in records:
+            result = self.validate(record)
+            results.append(result)
+            
+            if not result.is_valid:
+                logger.debug(
+                    f"Validation failed for forecast_id={result.forecast_id}: "
+                    f"{', '.join(result.errors)}"
+                )
+        
+        self.stats.end_time = datetime.now()
+        logger.info(f"Batch validation complete: {self.get_stats_summary()}")
+        
+        return results
+    
+    def get_stats_summary(self) -> str:
+        """Get formatted statistics summary"""
+        duration = None
+        if self.stats.start_time and self.stats.end_time:
+            duration = (self.stats.end_time - self.stats.start_time).total_seconds()
+        
+        return (
+            f"Total: {self.stats.total_records}, "
+            f"Valid: {self.stats.valid_records}, "
+            f"Invalid: {self.stats.invalid_records}, "
+            f"Duplicates: {self.stats.duplicate_records}, "
+            f"Format Errors: {self.stats.format_errors}, "
+            f"Business Rule Errors: {self.stats.business_rule_errors}"
+            f"{f', Duration: {duration:.2f}s' if duration else ''}"
+        )
+    
+    def reset_stats(self):
+        """Reset validation statistics and seen IDs"""
+        self.seen_ids.clear()
+        self.stats = ValidationStats(start_time=datetime.now())
+        logger.info("Validation statistics reset")
+
+
+def create_validator_from_config(config_path: str) -> ForecastIDValidator:
+    """
+    Factory function to create validator from configuration file.
+    
+    Args:
+        config_path: Path to YAML configuration file
+        
+    Returns:
+        Configured ForecastIDValidator instance
+    """
+    import yaml
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    validation_config = config.get('validation', {})
+    return ForecastIDValidator(validation_config)
+
+
+def split_valid_invalid_records(
+    records: List[Dict],
+    results: List[ValidationResult]
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Split records into valid and invalid based on validation results.
+    
+    Args:
+        records: Original records
+        results: Validation results
+        
+    Returns:
+        Tuple of (valid_records, invalid_records)
+    """
+    valid_records = []
+    invalid_records = []
+    
+    for record, result in zip(records, results):
+        enriched_record = record.copy()
+        enriched_record['validation_result'] = {
+            'is_valid': result.is_valid,
+            'errors': result.errors,
+            'warnings': result.warnings,
+            'metadata': result.metadata
+        }
+        
+        if result.is_valid:
+            valid_records.append(enriched_record)
+        else:
+            invalid_records.append(enriched_record)
+    
+    return valid_records, invalid_records
