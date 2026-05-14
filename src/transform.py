@@ -1,417 +1,329 @@
 """
-Sales Forecast Data Transformation Module
-Transforms and enriches sales forecast data
+Transform module for Customer and Sales Order data processing.
+Applies business rules, data quality checks, and transformations.
 """
 
 import logging
-from typing import Dict, Any, List
-import nipyapi
-from nipyapi.nifi import ProcessorConfigDTO, ProcessGroupEntity
-import yaml
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+import re
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class SalesForecastTransformer:
-    """Handles transformation of sales forecast data"""
+class DataTransformer:
+    """Transforms and enriches customer and sales order data."""
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the transformer with configuration
+        Initialize the DataTransformer.
         
         Args:
-            config_path: Path to configuration file
+            config: Configuration dictionary containing transformation rules
         """
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+        self.config = config
+        self.transform_config = config.get('transformations', {})
         
-        self.nifi_config = self.config['nifi']
-        self.transform_config = self.config['transformations']
-        
-    def connect_to_nifi(self) -> bool:
+    def transform_customers(self, customers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Establish connection to NiFi instance
-        
-        Returns:
-            bool: True if connection successful
-        """
-        try:
-            nipyapi.config.nifi_config.host = self.nifi_config['host']
-            nipyapi.config.nifi_config.port = self.nifi_config['port']
-            
-            nipyapi.canvas.get_root_pg_id()
-            logger.info(f"Successfully connected to NiFi at {self.nifi_config['host']}:{self.nifi_config['port']}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to NiFi: {str(e)}")
-            raise
-    
-    def create_transformation_process_group(self, parent_pg_id: str = None) -> ProcessGroupEntity:
-        """
-        Create process group for transformation workflow
+        Transform customer master data.
         
         Args:
-            parent_pg_id: Parent process group ID, defaults to root
+            customers: List of raw customer records
             
         Returns:
-            ProcessGroupEntity: Created process group
+            List of transformed customer records
         """
-        try:
-            if parent_pg_id is None:
-                parent_pg_id = nipyapi.canvas.get_root_pg_id()
-            
-            pg_name = self.config['process_groups']['transformation']['name']
-            
-            existing_pg = nipyapi.canvas.get_process_group(pg_name, 'name')
-            if existing_pg:
-                logger.info(f"Process group '{pg_name}' already exists")
-                return existing_pg
-            
-            process_group = nipyapi.canvas.create_process_group(
-                parent_pg=nipyapi.canvas.get_process_group(parent_pg_id, 'id'),
-                name=pg_name,
-                location=(100, 300)
-            )
-            
-            logger.info(f"Created transformation process group: {pg_name}")
-            return process_group
-            
-        except Exception as e:
-            logger.error(f"Failed to create transformation process group: {str(e)}")
-            raise
-    
-    def create_record_enrichment_processor(self, process_group: ProcessGroupEntity) -> Any:
+        logger.info(f"Transforming {len(customers)} customer records")
+        
+        transformed = []
+        for customer in customers:
+            try:
+                transformed_customer = self._transform_customer_record(customer)
+                if transformed_customer:
+                    transformed.append(transformed_customer)
+            except Exception as e:
+                logger.error(f"Error transforming customer {customer.get('customer_id')}: {str(e)}")
+                
+        logger.info(f"Successfully transformed {len(transformed)} customer records")
+        return transformed
+        
+    def transform_customer_addresses(self, addresses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Create processor to enrich records with additional data
+        Transform customer address data.
         
         Args:
-            process_group: Parent process group
+            addresses: List of raw address records
             
         Returns:
-            Processor entity
+            List of transformed address records
         """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.UpdateRecord'),
-                location=(200, 200),
-                name='Enrich_Customer_Records'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'CSVRecordSetWriter',
-                'Replacement Value Strategy': 'Record Path Value'
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created record enrichment processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create record enrichment processor: {str(e)}")
-            raise
-    
-    def create_data_cleansing_processor(self, process_group: ProcessGroupEntity) -> Any:
+        logger.info(f"Transforming {len(addresses)} address records")
+        
+        transformed = []
+        for address in addresses:
+            try:
+                transformed_address = self._transform_address_record(address)
+                if transformed_address:
+                    transformed.append(transformed_address)
+            except Exception as e:
+                logger.error(f"Error transforming address {address.get('address_id')}: {str(e)}")
+                
+        logger.info(f"Successfully transformed {len(transformed)} address records")
+        return transformed
+        
+    def transform_customer_transactions(self, transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Create processor to cleanse and standardize data
+        Transform customer transaction data.
         
         Args:
-            process_group: Parent process group
+            transactions: List of raw transaction records
             
         Returns:
-            Processor entity
+            List of transformed transaction records
         """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.UpdateRecord'),
-                location=(500, 200),
-                name='Cleanse_Data_Fields'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'CSVRecordSetWriter',
-                'Replacement Value Strategy': 'Record Path Value',
-                '/email': "trim(${field.value})",
-                '/phone': "replace(${field.value}, '[^0-9]', '')",
-                '/zip_code': "padLeft(${field.value}, 5, '0')"
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created data cleansing processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create data cleansing processor: {str(e)}")
-            raise
-    
-    def create_aggregation_processor(self, process_group: ProcessGroupEntity) -> Any:
+        logger.info(f"Transforming {len(transactions)} transaction records")
+        
+        transformed = []
+        for transaction in transactions:
+            try:
+                transformed_transaction = self._transform_transaction_record(transaction)
+                if transformed_transaction:
+                    transformed.append(transformed_transaction)
+            except Exception as e:
+                logger.error(f"Error transforming transaction {transaction.get('transaction_id')}: {str(e)}")
+                
+        logger.info(f"Successfully transformed {len(transformed)} transaction records")
+        return transformed
+        
+    def transform_sales_orders(self, orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Create processor to aggregate sales forecast data
+        Transform sales order data.
         
         Args:
-            process_group: Parent process group
+            orders: List of raw sales order records
             
         Returns:
-            Processor entity
+            List of transformed sales order records
         """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.QueryRecord'),
-                location=(200, 400),
-                name='Aggregate_Sales_Forecast'
-            )
-            
-            aggregation_query = self.transform_config['aggregation']['query']
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'CSVRecordSetWriter',
-                'aggregated': aggregation_query,
-                'Include Zero Record FlowFiles': 'false'
-            }
-            config.auto_terminated_relationships = ['original']
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created aggregation processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create aggregation processor: {str(e)}")
-            raise
-    
-    def create_join_processor(self, process_group: ProcessGroupEntity) -> Any:
-        """
-        Create processor to join customer and forecast data
+        logger.info(f"Transforming {len(orders)} sales order records")
         
-        Args:
-            process_group: Parent process group
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.JoinEnrichment'),
-                location=(800, 300),
-                name='Join_Customer_Forecast'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'CSVRecordSetWriter',
-                'Join Strategy': 'Inner Join',
-                'Enrichment Record Path': '/customer_id',
-                'Original Record Path': '/customer_id'
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created join processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create join processor: {str(e)}")
-            raise
-    
-    def create_format_conversion_processor(self, process_group: ProcessGroupEntity) -> Any:
-        """
-        Create processor to convert data format
+        transformed = []
+        for order in orders:
+            try:
+                transformed_order = self._transform_sales_order_record(order)
+                if transformed_order:
+                    transformed.append(transformed_order)
+            except Exception as e:
+                logger.error(f"Error transforming order {order.get('order_id')}: {str(e)}")
+                
+        logger.info(f"Successfully transformed {len(transformed)} sales order records")
+        return transformed
         
-        Args:
-            process_group: Parent process group
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.ConvertRecord'),
-                location=(1100, 300),
-                name='Convert_To_JSON'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Record Reader': 'CSVReader',
-                'Record Writer': 'JsonRecordSetWriter',
-                'Include Zero Record FlowFiles': 'false'
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created format conversion processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create format conversion processor: {str(e)}")
-            raise
-    
-    def create_quality_check_processor(self, process_group: ProcessGroupEntity) -> Any:
-        """
-        Create processor to perform data quality checks
+    def _transform_customer_record(self, customer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply transformations to customer record."""
+        transformed = customer.copy()
         
-        Args:
-            process_group: Parent process group
-            
-        Returns:
-            Processor entity
-        """
-        try:
-            processor = nipyapi.canvas.create_processor(
-                parent_pg=process_group,
-                processor=nipyapi.canvas.get_processor_type('org.apache.nifi.processors.standard.RouteOnAttribute'),
-                location=(1100, 500),
-                name='Quality_Check_Router'
-            )
-            
-            config = ProcessorConfigDTO()
-            config.properties = {
-                'Routing Strategy': 'Route to Property name',
-                'valid_record': "${record.count:gt(0):and(${email:isEmpty():not()})}",
-                'invalid_record': "${record.count:equals(0):or(${email:isEmpty()})}"
-            }
-            config.auto_terminated_relationships = []
-            
-            nipyapi.canvas.update_processor(processor, config)
-            
-            logger.info(f"Created quality check processor: {processor.id}")
-            return processor
-            
-        except Exception as e:
-            logger.error(f"Failed to create quality check processor: {str(e)}")
-            raise
-    
-    def build_transformation_pipeline(self) -> Dict[str, Any]:
-        """
-        Build complete transformation pipeline
+        # Standardize name fields
+        transformed['first_name'] = self._standardize_name(customer['first_name'])
+        transformed['last_name'] = self._standardize_name(customer['last_name'])
+        transformed['full_name'] = f"{transformed['first_name']} {transformed['last_name']}"
         
-        Returns:
-            Dictionary containing all created components
-        """
-        try:
-            logger.info("Building transformation pipeline...")
+        # Validate and standardize email
+        if customer.get('email'):
+            transformed['email'] = self._standardize_email(customer['email'])
+            transformed['email_valid'] = self._validate_email(transformed['email'])
+        else:
+            transformed['email_valid'] = False
             
-            self.connect_to_nifi()
+        # Standardize phone
+        if customer.get('phone'):
+            transformed['phone'] = self._standardize_phone(customer['phone'])
             
-            transform_pg = self.create_transformation_process_group()
-            
-            enrichment_proc = self.create_record_enrichment_processor(transform_pg)
-            cleansing_proc = self.create_data_cleansing_processor(transform_pg)
-            aggregation_proc = self.create_aggregation_processor(transform_pg)
-            join_proc = self.create_join_processor(transform_pg)
-            conversion_proc = self.create_format_conversion_processor(transform_pg)
-            quality_proc = self.create_quality_check_processor(transform_pg)
-            
-            self._create_connections(
-                transform_pg,
-                enrichment_proc,
-                cleansing_proc,
-                aggregation_proc,
-                join_proc,
-                conversion_proc,
-                quality_proc
-            )
-            
-            components = {
-                'process_group': transform_pg,
-                'enrichment_processor': enrichment_proc,
-                'cleansing_processor': cleansing_proc,
-                'aggregation_processor': aggregation_proc,
-                'join_processor': join_proc,
-                'conversion_processor': conversion_proc,
-                'quality_processor': quality_proc
-            }
-            
-            logger.info("Transformation pipeline built successfully")
-            return components
-            
-        except Exception as e:
-            logger.error(f"Failed to build transformation pipeline: {str(e)}")
-            raise
-    
-    def _create_connections(self, process_group: ProcessGroupEntity,
-                           enrichment: Any, cleansing: Any, aggregation: Any,
-                           join: Any, conversion: Any, quality: Any) -> None:
-        """
-        Create connections between transformation processors
+        # Standardize address
+        transformed['address_line1'] = self._standardize_address(customer.get('address_line1', ''))
+        transformed['address_line2'] = self._standardize_address(customer.get('address_line2', ''))
+        transformed['city'] = self._standardize_name(customer.get('city', ''))
+        transformed['state'] = customer.get('state', '').upper()
+        transformed['zip_code'] = self._standardize_zip(customer.get('zip_code', ''))
+        transformed['country'] = customer.get('country', 'US').upper()
         
-        Args:
-            process_group: Parent process group
-            enrichment: Enrichment processor
-            cleansing: Cleansing processor
-            aggregation: Aggregation processor
-            join: Join processor
-            conversion: Conversion processor
-            quality: Quality check processor
-        """
-        try:
-            nipyapi.canvas.create_connection(
-                source=enrichment,
-                target=cleansing,
-                relationships=['success']
-            )
+        # Parse registration date
+        if customer.get('registration_date'):
+            transformed['registration_date'] = self._parse_date(customer['registration_date'])
             
-            nipyapi.canvas.create_connection(
-                source=cleansing,
-                target=join,
-                relationships=['success']
-            )
-            
-            nipyapi.canvas.create_connection(
-                source=aggregation,
-                target=join,
-                relationships=['aggregated']
-            )
-            
-            nipyapi.canvas.create_connection(
-                source=join,
-                target=conversion,
-                relationships=['joined']
-            )
-            
-            nipyapi.canvas.create_connection(
-                source=conversion,
-                target=quality,
-                relationships=['success']
-            )
-            
-            logger.info("Created all connections in transformation pipeline")
-            
-        except Exception as e:
-            logger.error(f"Failed to create connections: {str(e)}")
-            raise
-
-
-def main():
-    """Main execution function"""
-    try:
-        transformer = SalesForecastTransformer()
-        components = transformer.build_transformation_pipeline()
-        logger.info(f"Transformation pipeline deployed with {len(components)} components")
+        # Add metadata
+        transformed['processed_timestamp'] = datetime.now().isoformat()
+        transformed['data_quality_score'] = self._calculate_customer_quality_score(transformed)
         
-    except Exception as e:
-        logger.error(f"Transformation pipeline deployment failed: {str(e)}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
+        return transformed
+        
+    def _transform_address_record(self, address: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply transformations to address record."""
+        transformed = address.copy()
+        
+        # Standardize address fields
+        transformed['address_line1'] = self._standardize_address(address.get('address_line1', ''))
+        transformed['address_line2'] = self._standardize_address(address.get('address_line2', ''))
+        transformed['city'] = self._standardize_name(address.get('city', ''))
+        transformed['state'] = address.get('state', '').upper()
+        transformed['zip_code'] = self._standardize_zip(address.get('zip_code', ''))
+        transformed['country'] = address.get('country', 'US').upper()
+        
+        # Validate address type
+        valid_types = ['PRIMARY', 'BILLING', 'SHIPPING', 'OTHER']
+        address_type = address.get('address_type', 'PRIMARY').upper()
+        transformed['address_type'] = address_type if address_type in valid_types else 'OTHER'
+        
+        # Add metadata
+        transformed['processed_timestamp'] = datetime.now().isoformat()
+        transformed['address_complete'] = self._is_address_complete(transformed)
+        
+        return transformed
+        
+    def _transform_transaction_record(self, transaction: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply transformations to transaction record."""
+        transformed = transaction.copy()
+        
+        # Parse transaction date
+        if transaction.get('transaction_date'):
+            transformed['transaction_date'] = self._parse_date(transaction['transaction_date'])
+            
+        # Standardize amount
+        transformed['amount'] = round(float(transaction['amount']), 2)
+        
+        # Categorize transaction
+        transformed['transaction_category'] = self._categorize_transaction(
+            transaction.get('transaction_type', ''),
+            transformed['amount']
+        )
+        
+        # Add metadata
+        transformed['processed_timestamp'] = datetime.now().isoformat()
+        
+        return transformed
+        
+    def _transform_sales_order_record(self, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply transformations to sales order record."""
+        transformed = order.copy()
+        
+        # Parse order date
+        if order.get('order_date'):
+            transformed['order_date'] = self._parse_date(order['order_date'])
+            
+        # Standardize order total
+        transformed['order_total'] = round(float(order['order_total']), 2)
+        
+        # Validate order status
+        valid_statuses = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED']
+        order_status = order.get('order_status', 'PENDING').upper()
+        transformed['order_status'] = order_status if order_status in valid_statuses else 'PENDING'
+        
+        # Calculate order priority
+        transformed['order_priority'] = self._calculate_order_priority(transformed)
+        
+        # Add metadata
+        transformed['processed_timestamp'] = datetime.now().isoformat()
+        
+        return transformed
+        
+    def _standardize_name(self, name: str) -> str:
+        """Standardize name field."""
+        if not name:
+            return ''
+        return ' '.join(word.capitalize() for word in name.strip().split())
+        
+    def _standardize_email(self, email: str) -> str:
+        """Standardize email address."""
+        return email.strip().lower()
+        
+    def _validate_email(self, email: str) -> bool:
+        """Validate email format."""
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(pattern, email))
+        
+    def _standardize_phone(self, phone: str) -> str:
+        """Standardize phone number."""
+        digits = re.sub(r'\D', '', phone)
+        if len(digits) == 10:
+            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        return phone
+        
+    def _standardize_address(self, address: str) -> str:
+        """Standardize address field."""
+        if not address:
+            return ''
+        return ' '.join(address.strip().split())
+        
+    def _standardize_zip(self, zip_code: str) -> str:
+        """Standardize ZIP code."""
+        digits = re.sub(r'\D', '', zip_code)
+        if len(digits) == 5:
+            return digits
+        elif len(digits) == 9:
+            return f"{digits[:5]}-{digits[5:]}"
+        return zip_code
+        
+    def _parse_date(self, date_str: str) -> str:
+        """Parse and standardize date string."""
+        try:
+            formats = ['%Y-%m-%d', '%m/%d/%Y', '%Y-%m-%d %H:%M:%S']
+            for fmt in formats:
+                try:
+                    dt = datetime.strptime(date_str.strip(), fmt)
+                    return dt.strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+            return date_str
+        except Exception:
+            return date_str
+            
+    def _calculate_customer_quality_score(self, customer: Dict[str, Any]) -> float:
+        """Calculate data quality score for customer record."""
+        score = 0.0
+        max_score = 10.0
+        
+        if customer.get('email_valid'):
+            score += 2.0
+        if customer.get('phone'):
+            score += 1.5
+        if customer.get('address_line1'):
+            score += 2.0
+        if customer.get('city') and customer.get('state'):
+            score += 2.0
+        if customer.get('zip_code'):
+            score += 1.5
+        if customer.get('registration_date'):
+            score += 1.0
+            
+        return round(score / max_score * 100, 2)
+        
+    def _is_address_complete(self, address: Dict[str, Any]) -> bool:
+        """Check if address has all required fields."""
+        required = ['address_line1', 'city', 'state', 'zip_code', 'country']
+        return all(address.get(field) for field in required)
+        
+    def _categorize_transaction(self, transaction_type: str, amount: float) -> str:
+        """Categorize transaction based on type and amount."""
+        if amount < 0:
+            return 'REFUND'
+        elif amount > 1000:
+            return 'HIGH_VALUE'
+        elif transaction_type.upper() in ['PURCHASE', 'SALE']:
+            return 'STANDARD_PURCHASE'
+        else:
+            return 'OTHER'
+            
+    def _calculate_order_priority(self, order: Dict[str, Any]) -> str:
+        """Calculate order priority based on total and status."""
+        total = order.get('order_total', 0)
+        status = order.get('order_status', '')
+        
+        if status == 'CANCELLED':
+            return 'LOW'
+        elif total > 5000:
+            return 'HIGH'
+        elif total > 1000:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
