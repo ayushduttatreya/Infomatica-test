@@ -1,258 +1,318 @@
 """
-Transform module for customer address pipeline.
-Handles validation, cleansing, and enrichment of address data.
+Transform module for customer transaction loading pipeline.
+Handles data transformation, enrichment, and business rule application.
 """
+
 import logging
-import re
-from typing import Dict, Any, Tuple
-import pandas as pd
+from typing import Dict, List, Optional
 from datetime import datetime
+import pandas as pd
+import numpy as np
+from hashlib import sha256
 
 logger = logging.getLogger(__name__)
 
 
-class CustomerAddressTransformer:
-    """Transforms and validates customer address data."""
+class DataTransformer:
+    """Transforms customer and transaction data according to business rules."""
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict):
         """
-        Initialize transformer with configuration.
+        Initialize the data transformer.
         
         Args:
-            config: Configuration dictionary containing validation rules
+            config: Configuration dictionary containing transformation rules
         """
         self.config = config
-        self.validation_config = config.get('validation', {})
-        self.transform_config = config.get('transform', {})
+        self.transform_config = config.get('transformation', {})
+        self.business_rules = self.transform_config.get('business_rules', {})
         
-        # Validation patterns
-        self.zip_pattern = re.compile(r'^\d{5}(-\d{4})?$')
-        self.email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-        self.phone_pattern = re.compile(r'^\+?1?\d{10,15}$')
-        
-        # Valid state codes
-        self.valid_states = set([
-            'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-            'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-            'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-            'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-            'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
-        ])
-        
-        # Valid country codes
-        self.valid_countries = set(['US', 'USA', 'CA', 'MX'])
-        
-    def validate_address(self, row: pd.Series) -> Tuple[bool, str]:
+    def transform_customers(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Validate a single address record.
+        Transform customer data with cleansing and enrichment.
         
         Args:
-            row: Address record as pandas Series
+            df: Raw customer DataFrame
             
         Returns:
-            Tuple of (is_valid, error_message)
+            Transformed customer DataFrame
         """
-        errors = []
-        
-        # Required field validation
-        if pd.isna(row.get('street_address')) or not str(row.get('street_address')).strip():
-            errors.append("Missing street address")
+        try:
+            logger.info(f"Transforming {len(df)} customer records")
             
-        if pd.isna(row.get('city')) or not str(row.get('city')).strip():
-            errors.append("Missing city")
+            df_transformed = df.copy()
             
-        # State validation
-        state = str(row.get('state_province', '')).strip().upper()
-        if state and state not in self.valid_states:
-            errors.append(f"Invalid state code: {state}")
+            # Standardize names
+            df_transformed['first_name'] = df_transformed['first_name'].str.strip().str.title()
+            df_transformed['last_name'] = df_transformed['last_name'].str.strip().str.title()
+            df_transformed['full_name'] = (
+                df_transformed['first_name'] + ' ' + df_transformed['last_name']
+            )
             
-        # Postal code validation
-        postal_code = str(row.get('postal_code', '')).strip()
-        if postal_code and not self.zip_pattern.match(postal_code):
-            errors.append(f"Invalid postal code format: {postal_code}")
+            # Standardize email
+            df_transformed['email'] = df_transformed['email'].str.lower().str.strip()
+            df_transformed['email_domain'] = df_transformed['email'].str.split('@').str[1]
             
-        # Country validation
-        country = str(row.get('country_code', '')).strip().upper()
-        if country and country not in self.valid_countries:
-            errors.append(f"Invalid country code: {country}")
+            # Format phone numbers
+            df_transformed['phone'] = df_transformed['phone'].apply(self._format_phone)
             
-        is_valid = len(errors) == 0
-        error_message = "; ".join(errors) if errors else ""
-        
-        return is_valid, error_message
-        
-    def validate_customer(self, row: pd.Series) -> Tuple[bool, str]:
+            # Standardize addresses
+            df_transformed['address_line1'] = df_transformed['address_line1'].str.strip().str.title()
+            df_transformed['city'] = df_transformed['city'].str.strip().str.title()
+            df_transformed['state'] = df_transformed['state'].str.upper().str.strip()
+            df_transformed['country'] = df_transformed['country'].str.upper().str.strip()
+            df_transformed['zip_code'] = df_transformed['zip_code'].str.strip()
+            
+            # Create composite address
+            df_transformed['full_address'] = self._create_full_address(df_transformed)
+            
+            # Generate customer hash for change detection
+            df_transformed['customer_hash'] = df_transformed.apply(
+                lambda row: self._generate_hash(row, ['customer_id', 'email', 'phone']),
+                axis=1
+            )
+            
+            # Calculate customer tenure
+            df_transformed['customer_tenure_days'] = (
+                datetime.now() - pd.to_datetime(df_transformed['registration_date'])
+            ).dt.days
+            
+            # Categorize customer by tenure
+            df_transformed['customer_segment'] = df_transformed['customer_tenure_days'].apply(
+                self._categorize_customer_tenure
+            )
+            
+            # Validate status
+            valid_statuses = self.business_rules.get('valid_customer_statuses', 
+                                                     ['ACTIVE', 'INACTIVE', 'SUSPENDED'])
+            df_transformed['status'] = df_transformed['status'].str.upper()
+            df_transformed['status_valid'] = df_transformed['status'].isin(valid_statuses)
+            
+            # Add transformation metadata
+            df_transformed['transform_timestamp'] = datetime.now()
+            df_transformed['record_version'] = 1
+            
+            logger.info(f"Successfully transformed {len(df_transformed)} customer records")
+            return df_transformed
+            
+        except Exception as e:
+            logger.error(f"Error transforming customer data: {str(e)}")
+            raise
+    
+    def transform_transactions(self, df: pd.DataFrame, 
+                               customer_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
-        Validate a single customer record.
+        Transform transaction data with enrichment and calculations.
         
         Args:
-            row: Customer record as pandas Series
+            df: Raw transaction DataFrame
+            customer_df: Optional customer DataFrame for enrichment
             
         Returns:
-            Tuple of (is_valid, error_message)
+            Transformed transaction DataFrame
         """
-        errors = []
-        
-        # Email validation
-        email = str(row.get('email', '')).strip()
-        if email and not self.email_pattern.match(email):
-            errors.append(f"Invalid email format: {email}")
+        try:
+            logger.info(f"Transforming {len(df)} transaction records")
             
-        # Phone validation
-        phone = str(row.get('phone', '')).strip().replace('-', '').replace(' ', '')
-        if phone and not self.phone_pattern.match(phone):
-            errors.append(f"Invalid phone format: {phone}")
+            df_transformed = df.copy()
             
-        # Name validation
-        if pd.isna(row.get('first_name')) or not str(row.get('first_name')).strip():
-            errors.append("Missing first name")
+            # Ensure numeric fields
+            numeric_fields = ['amount', 'tax_amount', 'discount_amount', 'shipping_amount']
+            for field in numeric_fields:
+                if field in df_transformed.columns:
+                    df_transformed[field] = pd.to_numeric(
+                        df_transformed[field], errors='coerce'
+                    ).fillna(0)
             
-        if pd.isna(row.get('last_name')) or not str(row.get('last_name')).strip():
-            errors.append("Missing last name")
+            # Calculate total amount
+            df_transformed['total_amount'] = (
+                df_transformed.get('amount', 0) +
+                df_transformed.get('tax_amount', 0) +
+                df_transformed.get('shipping_amount', 0) -
+                df_transformed.get('discount_amount', 0)
+            )
             
-        is_valid = len(errors) == 0
-        error_message = "; ".join(errors) if errors else ""
-        
-        return is_valid, error_message
-        
-    def cleanse_address(self, df: pd.DataFrame) -> pd.DataFrame:
+            # Standardize transaction type and status
+            df_transformed['transaction_type'] = df_transformed['transaction_type'].str.upper()
+            df_transformed['status'] = df_transformed['status'].str.upper()
+            
+            # Categorize transaction amount
+            df_transformed['amount_category'] = df_transformed['total_amount'].apply(
+                self._categorize_transaction_amount
+            )
+            
+            # Extract date components
+            df_transformed['transaction_year'] = df_transformed['transaction_date'].dt.year
+            df_transformed['transaction_month'] = df_transformed['transaction_date'].dt.month
+            df_transformed['transaction_day'] = df_transformed['transaction_date'].dt.day
+            df_transformed['transaction_quarter'] = df_transformed['transaction_date'].dt.quarter
+            df_transformed['transaction_day_of_week'] = df_transformed['transaction_date'].dt.dayofweek
+            df_transformed['transaction_week_of_year'] = df_transformed['transaction_date'].dt.isocalendar().week
+            
+            # Flag weekend transactions
+            df_transformed['is_weekend'] = df_transformed['transaction_day_of_week'].isin([5, 6])
+            
+            # Enrich with customer data if provided
+            if customer_df is not None:
+                df_transformed = self._enrich_with_customer_data(df_transformed, customer_df)
+            
+            # Generate transaction hash
+            df_transformed['transaction_hash'] = df_transformed.apply(
+                lambda row: self._generate_hash(
+                    row, ['transaction_id', 'customer_id', 'total_amount']
+                ),
+                axis=1
+            )
+            
+            # Validate business rules
+            df_transformed['amount_valid'] = df_transformed['total_amount'] >= 0
+            df_transformed['date_valid'] = df_transformed['transaction_date'] <= datetime.now()
+            
+            # Add transformation metadata
+            df_transformed['transform_timestamp'] = datetime.now()
+            df_transformed['record_version'] = 1
+            
+            logger.info(f"Successfully transformed {len(df_transformed)} transaction records")
+            return df_transformed
+            
+        except Exception as e:
+            logger.error(f"Error transforming transaction data: {str(e)}")
+            raise
+    
+    def aggregate_customer_metrics(self, transactions_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Cleanse and standardize address data.
+        Aggregate transaction metrics by customer.
         
         Args:
-            df: Address DataFrame
+            transactions_df: Transformed transaction DataFrame
             
         Returns:
-            Cleansed DataFrame
+            DataFrame with customer-level aggregated metrics
         """
-        df = df.copy()
-        
-        # Standardize state codes
-        df['state_province'] = df['state_province'].str.strip().str.upper()
-        
-        # Standardize country codes
-        df['country_code'] = df['country_code'].str.strip().str.upper()
-        df['country_code'] = df['country_code'].replace({'USA': 'US'})
-        
-        # Standardize postal codes
-        df['postal_code'] = df['postal_code'].str.strip().str.upper()
-        
-        # Trim whitespace from text fields
-        text_fields = ['street_address', 'street_address2', 'city', 'address_type']
-        for field in text_fields:
-            if field in df.columns:
-                df[field] = df[field].str.strip()
-                
-        # Standardize boolean fields
-        if 'is_primary' in df.columns:
-            df['is_primary'] = df['is_primary'].map({
-                'Y': True, 'N': False, 'YES': True, 'NO': False,
-                '1': True, '0': False, 1: True, 0: False,
-                True: True, False: False
-            })
+        try:
+            logger.info("Aggregating customer transaction metrics")
             
-        if 'is_active' in df.columns:
-            df['is_active'] = df['is_active'].map({
-                'Y': True, 'N': False, 'YES': True, 'NO': False,
-                '1': True, '0': False, 1: True, 0: False,
-                True: True, False: False
-            })
+            metrics = transactions_df.groupby('customer_id').agg({
+                'transaction_id': 'count',
+                'total_amount': ['sum', 'mean', 'max', 'min'],
+                'transaction_date': ['min', 'max']
+            }).reset_index()
             
-        return df
-        
-    def enrich_addresses(self, addresses: pd.DataFrame, customers: pd.DataFrame) -> pd.DataFrame:
-        """
-        Enrich address data with customer information.
-        
-        Args:
-            addresses: Address DataFrame
-            customers: Customer DataFrame
+            # Flatten column names
+            metrics.columns = [
+                'customer_id',
+                'total_transactions',
+                'total_spent',
+                'avg_transaction_amount',
+                'max_transaction_amount',
+                'min_transaction_amount',
+                'first_transaction_date',
+                'last_transaction_date'
+            ]
             
-        Returns:
-            Enriched address DataFrame
-        """
-        # Merge customer data
-        enriched = addresses.merge(
-            customers[['customer_id', 'first_name', 'last_name', 'email', 'status']],
+            # Calculate additional metrics
+            metrics['customer_lifetime_days'] = (
+                metrics['last_transaction_date'] - metrics['first_transaction_date']
+            ).dt.days
+            
+            metrics['avg_days_between_transactions'] = (
+                metrics['customer_lifetime_days'] / metrics['total_transactions']
+            )
+            
+            # Categorize customer value
+            metrics['customer_value_segment'] = pd.qcut(
+                metrics['total_spent'],
+                q=4,
+                labels=['Low', 'Medium', 'High', 'Premium']
+            )
+            
+            metrics['aggregation_timestamp'] = datetime.now()
+            
+            logger.info(f"Aggregated metrics for {len(metrics)} customers")
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Error aggregating customer metrics: {str(e)}")
+            raise
+    
+    def _format_phone(self, phone: str) -> str:
+        """Format phone number to standard format."""
+        if pd.isna(phone):
+            return None
+        
+        # Remove non-numeric characters
+        digits = ''.join(filter(str.isdigit, str(phone)))
+        
+        # Format as (XXX) XXX-XXXX for 10-digit numbers
+        if len(digits) == 10:
+            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        
+        return phone
+    
+    def _create_full_address(self, df: pd.DataFrame) -> pd.Series:
+        """Create full address string from components."""
+        address_parts = []
+        
+        for _, row in df.iterrows():
+            parts = [
+                row.get('address_line1', ''),
+                row.get('address_line2', ''),
+                row.get('city', ''),
+                row.get('state', ''),
+                row.get('zip_code', ''),
+                row.get('country', '')
+            ]
+            
+            # Filter out empty parts
+            parts = [str(p).strip() for p in parts if pd.notna(p) and str(p).strip()]
+            address_parts.append(', '.join(parts))
+        
+        return pd.Series(address_parts, index=df.index)
+    
+    def _generate_hash(self, row: pd.Series, fields: List[str]) -> str:
+        """Generate SHA256 hash from specified fields."""
+        values = '|'.join([str(row.get(f, '')) for f in fields])
+        return sha256(values.encode()).hexdigest()
+    
+    def _categorize_customer_tenure(self, days: int) -> str:
+        """Categorize customer by tenure."""
+        if days < 30:
+            return 'NEW'
+        elif days < 180:
+            return 'RECENT'
+        elif days < 365:
+            return 'ESTABLISHED'
+        else:
+            return 'LOYAL'
+    
+    def _categorize_transaction_amount(self, amount: float) -> str:
+        """Categorize transaction by amount."""
+        thresholds = self.business_rules.get('amount_thresholds', {
+            'small': 50,
+            'medium': 200,
+            'large': 1000
+        })
+        
+        if amount < thresholds['small']:
+            return 'SMALL'
+        elif amount < thresholds['medium']:
+            return 'MEDIUM'
+        elif amount < thresholds['large']:
+            return 'LARGE'
+        else:
+            return 'EXTRA_LARGE'
+    
+    def _enrich_with_customer_data(self, transactions_df: pd.DataFrame,
+                                   customer_df: pd.DataFrame) -> pd.DataFrame:
+        """Enrich transactions with customer information."""
+        customer_fields = ['customer_id', 'full_name', 'email', 'customer_segment', 'state']
+        customer_subset = customer_df[customer_fields].copy()
+        
+        enriched = transactions_df.merge(
+            customer_subset,
             on='customer_id',
-            how='left'
-        )
-        
-        # Add processing metadata
-        enriched['processed_date'] = datetime.now()
-        enriched['record_hash'] = enriched.apply(
-            lambda row: hash(f"{row['address_id']}_{row['customer_id']}_{row['street_address']}"),
-            axis=1
+            how='left',
+            suffixes=('', '_customer')
         )
         
         return enriched
-        
-    def transform(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-        """
-        Execute full transformation pipeline.
-        
-        Args:
-            data: Dictionary containing customers and addresses DataFrames
-            
-        Returns:
-            Dictionary containing transformed data and validation results
-        """
-        customers = data['customers'].copy()
-        addresses = data['addresses'].copy()
-        
-        logger.info("Starting transformation pipeline")
-        
-        # Validate customers
-        logger.info("Validating customer records")
-        customer_validation = customers.apply(self.validate_customer, axis=1)
-        customers['is_valid'] = customer_validation.apply(lambda x: x[0])
-        customers['validation_errors'] = customer_validation.apply(lambda x: x[1])
-        
-        valid_customers = customers[customers['is_valid']].copy()
-        invalid_customers = customers[~customers['is_valid']].copy()
-        
-        logger.info(f"Valid customers: {len(valid_customers)}, Invalid: {len(invalid_customers)}")
-        
-        # Cleanse addresses
-        logger.info("Cleansing address records")
-        addresses = self.cleanse_address(addresses)
-        
-        # Validate addresses
-        logger.info("Validating address records")
-        address_validation = addresses.apply(self.validate_address, axis=1)
-        addresses['is_valid'] = address_validation.apply(lambda x: x[0])
-        addresses['validation_errors'] = address_validation.apply(lambda x: x[1])
-        
-        valid_addresses = addresses[addresses['is_valid']].copy()
-        invalid_addresses = addresses[~addresses['is_valid']].copy()
-        
-        logger.info(f"Valid addresses: {len(valid_addresses)}, Invalid: {len(invalid_addresses)}")
-        
-        # Check for orphaned addresses (no matching customer)
-        valid_customer_ids = set(valid_customers['customer_id'])
-        valid_addresses['has_customer'] = valid_addresses['customer_id'].isin(valid_customer_ids)
-        
-        orphaned_addresses = valid_addresses[~valid_addresses['has_customer']].copy()
-        valid_addresses = valid_addresses[valid_addresses['has_customer']].copy()
-        
-        logger.info(f"Orphaned addresses (no valid customer): {len(orphaned_addresses)}")
-        
-        # Enrich valid addresses
-        logger.info("Enriching address records")
-        enriched_addresses = self.enrich_addresses(valid_addresses, valid_customers)
-        
-        # Check for duplicate addresses
-        duplicate_check = enriched_addresses.groupby(
-            ['customer_id', 'street_address', 'city', 'postal_code']
-        ).size().reset_index(name='count')
-        duplicates = duplicate_check[duplicate_check['count'] > 1]
-        
-        logger.info(f"Duplicate address groups found: {len(duplicates)}")
-        
-        return {
-            'valid_addresses': enriched_addresses,
-            'invalid_addresses': invalid_addresses,
-            'invalid_customers': invalid_customers,
-            'orphaned_addresses': orphaned_addresses,
-            'duplicate_summary': duplicates
-        }
