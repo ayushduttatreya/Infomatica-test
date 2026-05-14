@@ -1,372 +1,339 @@
 """
-Customer Master Data Transformation Module
-Applies business rules and data quality transformations
+Transform module for customer address management logic.
+Implements address type validation, primary address flag management, and customer ID lookups.
 """
+
 import logging
-import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
+import pandas as pd
+import numpy as np
 from datetime import datetime
-from email_validator import validate_email, EmailNotValidError
 
 logger = logging.getLogger(__name__)
 
 
-class CustomerDataTransformer:
-    """Handles transformation of customer master data"""
+class CustomerAddressTransformer:
+    """Transforms customer and address data with business logic."""
     
-    def __init__(self, config: Dict):
+    # Valid address types based on business rules
+    VALID_ADDRESS_TYPES = {
+        'HOME', 'WORK', 'BILLING', 'SHIPPING', 'MAILING', 'OTHER'
+    }
+    
+    # Valid country codes (ISO 3166-1 alpha-2)
+    VALID_COUNTRIES = {
+        'US', 'CA', 'MX', 'GB', 'DE', 'FR', 'IT', 'ES', 'AU', 'JP', 'CN', 'IN'
+    }
+    
+    # Valid US state codes
+    VALID_US_STATES = {
+        'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+        'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+        'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+        'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+        'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
+    }
+    
+    def __init__(self, config: Dict[str, Any]):
         """
-        Initialize transformer with configuration
+        Initialize transformer with configuration.
         
         Args:
-            config: Configuration dictionary containing transformation rules
+            config: Configuration dictionary
         """
         self.config = config
-        self.transform_config = config.get('transformation', {})
-        self.validation_rules = self.transform_config.get('validation_rules', {})
-        self.default_values = self.transform_config.get('default_values', {})
+        self.transform_config = config.get('transform', {})
+        self.validation_config = self.transform_config.get('validation', {})
         
-    def transform_customers(self, customers: List[Dict]) -> Dict[str, List[Dict]]:
+    def validate_address_type(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transform customer records applying business rules
+        Validate and standardize address types.
         
         Args:
-            customers: List of raw customer dictionaries
+            df: DataFrame with address_type column
             
         Returns:
-            Dictionary with 'valid' and 'invalid' customer lists
+            DataFrame with validated address_type and validation flag
         """
-        logger.info(f"Transforming {len(customers)} customer records")
+        logger.info("Validating address types")
         
-        valid_customers = []
-        invalid_customers = []
+        df = df.copy()
         
-        for customer in customers:
-            try:
-                transformed = self._transform_customer(customer)
-                
-                # Validate transformed record
-                validation_result = self._validate_customer(transformed)
-                
-                if validation_result['is_valid']:
-                    valid_customers.append(transformed)
-                else:
-                    transformed['validation_errors'] = validation_result['errors']
-                    invalid_customers.append(transformed)
-                    logger.warning(
-                        f"Customer {customer.get('customer_id')} failed validation: "
-                        f"{validation_result['errors']}"
-                    )
-                    
-            except Exception as e:
-                logger.error(f"Error transforming customer {customer.get('customer_id')}: {e}")
-                customer['transformation_error'] = str(e)
-                invalid_customers.append(customer)
+        # Standardize to uppercase and strip whitespace
+        df['address_type'] = df['address_type'].str.upper().str.strip()
         
-        logger.info(
-            f"Transformation complete: {len(valid_customers)} valid, "
-            f"{len(invalid_customers)} invalid"
-        )
+        # Create validation flag
+        df['address_type_valid'] = df['address_type'].isin(self.VALID_ADDRESS_TYPES)
         
-        return {
-            'valid': valid_customers,
-            'invalid': invalid_customers
-        }
+        # Handle invalid types based on config
+        default_type = self.validation_config.get('default_address_type', 'OTHER')
+        
+        invalid_count = (~df['address_type_valid']).sum()
+        if invalid_count > 0:
+            logger.warning(f"Found {invalid_count} invalid address types, setting to {default_type}")
+            df.loc[~df['address_type_valid'], 'address_type'] = default_type
+            df.loc[~df['address_type_valid'], 'address_type_valid'] = True
+        
+        logger.info(f"Address type validation complete: {len(df)} records processed")
+        return df
     
-    def transform_addresses(self, addresses: List[Dict]) -> Dict[str, List[Dict]]:
+    def set_primary_address_flags(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transform address records
+        Set primary address flags ensuring only one primary address per customer.
+        Business rule: If multiple addresses marked as primary, keep the most recent.
+        If no primary address, set the first active address as primary.
         
         Args:
-            addresses: List of raw address dictionaries
+            df: DataFrame with customer addresses
             
         Returns:
-            Dictionary with 'valid' and 'invalid' address lists
+            DataFrame with corrected is_primary flags
         """
-        logger.info(f"Transforming {len(addresses)} address records")
+        logger.info("Setting primary address flags")
         
-        valid_addresses = []
-        invalid_addresses = []
+        df = df.copy()
         
-        for address in addresses:
-            try:
-                transformed = self._transform_address(address)
-                
-                validation_result = self._validate_address(transformed)
-                
-                if validation_result['is_valid']:
-                    valid_addresses.append(transformed)
-                else:
-                    transformed['validation_errors'] = validation_result['errors']
-                    invalid_addresses.append(transformed)
-                    
-            except Exception as e:
-                logger.error(f"Error transforming address {address.get('address_id')}: {e}")
-                address['transformation_error'] = str(e)
-                invalid_addresses.append(address)
+        # Convert is_primary to boolean
+        df['is_primary'] = df['is_primary'].map({
+            'Y': True, 'YES': True, '1': True, 'TRUE': True, True: True,
+            'N': False, 'NO': False, '0': False, 'FALSE': False, False: False
+        }).fillna(False)
         
-        logger.info(
-            f"Address transformation complete: {len(valid_addresses)} valid, "
-            f"{len(invalid_addresses)} invalid"
-        )
+        # Convert is_active to boolean
+        df['is_active'] = df['is_active'].map({
+            'Y': True, 'YES': True, '1': True, 'TRUE': True, True: True,
+            'N': False, 'NO': False, '0': False, 'FALSE': False, False: False
+        }).fillna(True)
         
-        return {
-            'valid': valid_addresses,
-            'invalid': invalid_addresses
-        }
+        # Sort by customer_id and address_id for consistent processing
+        df = df.sort_values(['customer_id', 'address_id'])
+        
+        # Reset all primary flags first
+        df['is_primary'] = False
+        
+        # Group by customer and set primary address
+        def set_primary_for_customer(group):
+            active_addresses = group[group['is_active']]
+            
+            if len(active_addresses) == 0:
+                # No active addresses, no primary
+                return group
+            
+            # Set the first active address as primary
+            first_active_idx = active_addresses.index[0]
+            group.loc[first_active_idx, 'is_primary'] = True
+            
+            return group
+        
+        df = df.groupby('customer_id', group_keys=False).apply(set_primary_for_customer)
+        
+        # Log statistics
+        primary_count = df['is_primary'].sum()
+        customer_count = df['customer_id'].nunique()
+        logger.info(f"Primary address flags set: {primary_count} primary addresses for {customer_count} customers")
+        
+        return df
     
-    def _transform_customer(self, customer: Dict) -> Dict:
-        """Apply transformations to a single customer record"""
-        transformed = customer.copy()
+    def validate_geography(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Validate geographic data (country, state, zip code).
         
-        # Standardize customer_id
-        transformed['customer_id'] = self._standardize_id(
-            transformed.get('customer_id', '')
-        )
+        Args:
+            df: DataFrame with geographic fields
+            
+        Returns:
+            DataFrame with validation flags
+        """
+        logger.info("Validating geographic data")
         
-        # Standardize names
-        transformed['first_name'] = self._standardize_name(
-            transformed.get('first_name', '')
-        )
-        transformed['last_name'] = self._standardize_name(
-            transformed.get('last_name', '')
-        )
+        df = df.copy()
         
-        # Create full name
-        transformed['full_name'] = f"{transformed['first_name']} {transformed['last_name']}".strip()
+        # Standardize country codes
+        df['country'] = df['country'].str.upper().str.strip()
+        df['country_valid'] = df['country'].isin(self.VALID_COUNTRIES)
         
-        # Standardize email
-        transformed['email'] = self._standardize_email(
-            transformed.get('email', '')
-        )
+        # Validate US states
+        df['state'] = df['state'].str.upper().str.strip()
+        df['state_valid'] = True  # Default to valid
         
-        # Standardize phone
-        transformed['phone'] = self._standardize_phone(
-            transformed.get('phone', '')
-        )
+        # For US addresses, validate state codes
+        us_mask = df['country'] == 'US'
+        df.loc[us_mask, 'state_valid'] = df.loc[us_mask, 'state'].isin(self.VALID_US_STATES)
         
-        # Standardize address fields
-        transformed['address_line1'] = self._standardize_address(
-            transformed.get('address_line1', '')
-        )
-        transformed['address_line2'] = self._standardize_address(
-            transformed.get('address_line2', '')
-        )
-        transformed['city'] = self._standardize_name(
-            transformed.get('city', '')
-        )
+        # Validate zip code format for US (5 digits or 5+4 format)
+        df['zip_code_valid'] = True
+        us_zip_pattern = r'^\d{5}(-\d{4})?$'
+        df.loc[us_mask, 'zip_code_valid'] = df.loc[us_mask, 'zip_code'].str.match(us_zip_pattern, na=False)
         
-        # Standardize state (uppercase)
-        transformed['state'] = transformed.get('state', '').strip().upper()
+        # Log validation results
+        invalid_country = (~df['country_valid']).sum()
+        invalid_state = (~df['state_valid']).sum()
+        invalid_zip = (~df['zip_code_valid']).sum()
         
-        # Standardize zip code
-        transformed['zip_code'] = self._standardize_zip(
-            transformed.get('zip_code', '')
-        )
+        if invalid_country > 0:
+            logger.warning(f"Found {invalid_country} invalid country codes")
+        if invalid_state > 0:
+            logger.warning(f"Found {invalid_state} invalid state codes")
+        if invalid_zip > 0:
+            logger.warning(f"Found {invalid_zip} invalid zip codes")
         
-        # Standardize country (uppercase)
-        transformed['country'] = transformed.get('country', '').strip().upper()
-        if not transformed['country']:
-            transformed['country'] = self.default_values.get('country', 'US')
-        
-        # Parse and standardize registration date
-        transformed['registration_date'] = self._parse_date(
-            transformed.get('registration_date', '')
-        )
-        
-        # Standardize status
-        transformed['status'] = self._standardize_status(
-            transformed.get('status', '')
-        )
-        
-        # Add transformation metadata
-        transformed['transform_timestamp'] = datetime.now().isoformat()
-        
-        return transformed
+        return df
     
-    def _transform_address(self, address: Dict) -> Dict:
-        """Apply transformations to a single address record"""
-        transformed = address.copy()
+    def enrich_with_customer_data(
+        self, 
+        addresses_df: pd.DataFrame, 
+        customers_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Enrich address data with customer information via customer ID lookup.
         
-        # Standardize IDs
-        transformed['address_id'] = self._standardize_id(
-            transformed.get('address_id', '')
-        )
-        transformed['customer_id'] = self._standardize_id(
-            transformed.get('customer_id', '')
-        )
+        Args:
+            addresses_df: Address DataFrame
+            customers_df: Customer DataFrame
+            
+        Returns:
+            Enriched DataFrame with customer information
+        """
+        logger.info("Enriching addresses with customer data")
         
-        # Standardize address type
-        transformed['address_type'] = self._standardize_address_type(
-            transformed.get('address_type', '')
-        )
-        
-        # Add transformation metadata
-        transformed['transform_timestamp'] = datetime.now().isoformat()
-        
-        return transformed
-    
-    def _validate_customer(self, customer: Dict) -> Dict:
-        """Validate transformed customer record"""
-        errors = []
-        
-        # Validate customer_id
-        if not customer.get('customer_id'):
-            errors.append("customer_id is required")
-        elif len(customer['customer_id']) > 10:
-            errors.append("customer_id exceeds maximum length of 10")
-        
-        # Validate names
-        if not customer.get('first_name'):
-            errors.append("first_name is required")
-        if not customer.get('last_name'):
-            errors.append("last_name is required")
-        
-        # Validate email
-        if customer.get('email'):
-            try:
-                validate_email(customer['email'])
-            except EmailNotValidError:
-                errors.append("email format is invalid")
-        elif self.validation_rules.get('email_required', False):
-            errors.append("email is required")
-        
-        # Validate phone
-        if customer.get('phone'):
-            if not re.match(r'^\d{10}$', customer['phone']):
-                errors.append("phone must be 10 digits")
-        
-        # Validate state
-        if customer.get('state'):
-            valid_states = self.validation_rules.get('valid_states', [])
-            if valid_states and customer['state'] not in valid_states:
-                errors.append(f"state '{customer['state']}' is not valid")
-        
-        # Validate zip code
-        if customer.get('zip_code'):
-            if not re.match(r'^\d{5}(-\d{4})?$', customer['zip_code']):
-                errors.append("zip_code format is invalid")
-        
-        # Validate country
-        if customer.get('country'):
-            valid_countries = self.validation_rules.get('valid_countries', [])
-            if valid_countries and customer['country'] not in valid_countries:
-                errors.append(f"country '{customer['country']}' is not valid")
-        
-        # Validate status
-        valid_statuses = self.validation_rules.get('valid_statuses', ['ACTIVE', 'INACTIVE', 'SUSPENDED'])
-        if customer.get('status') not in valid_statuses:
-            errors.append(f"status must be one of {valid_statuses}")
-        
-        return {
-            'is_valid': len(errors) == 0,
-            'errors': errors
-        }
-    
-    def _validate_address(self, address: Dict) -> Dict:
-        """Validate transformed address record"""
-        errors = []
-        
-        if not address.get('address_id'):
-            errors.append("address_id is required")
-        
-        if not address.get('customer_id'):
-            errors.append("customer_id is required")
-        
-        valid_types = self.validation_rules.get('valid_address_types', ['BILLING', 'SHIPPING', 'MAILING'])
-        if address.get('address_type') not in valid_types:
-            errors.append(f"address_type must be one of {valid_types}")
-        
-        return {
-            'is_valid': len(errors) == 0,
-            'errors': errors
-        }
-    
-    def _standardize_id(self, value: str) -> str:
-        """Standardize ID field"""
-        return value.strip().upper()
-    
-    def _standardize_name(self, value: str) -> str:
-        """Standardize name field (title case)"""
-        return value.strip().title()
-    
-    def _standardize_email(self, value: str) -> str:
-        """Standardize email (lowercase)"""
-        return value.strip().lower()
-    
-    def _standardize_phone(self, value: str) -> str:
-        """Standardize phone number (digits only)"""
-        return re.sub(r'\D', '', value)
-    
-    def _standardize_address(self, value: str) -> str:
-        """Standardize address field"""
-        return value.strip().title()
-    
-    def _standardize_zip(self, value: str) -> str:
-        """Standardize zip code"""
-        # Remove spaces and hyphens, then reformat
-        digits = re.sub(r'[^\d]', '', value)
-        if len(digits) == 9:
-            return f"{digits[:5]}-{digits[5:]}"
-        return digits[:5]
-    
-    def _standardize_status(self, value: str) -> str:
-        """Standardize status field"""
-        status = value.strip().upper()
-        status_mapping = self.transform_config.get('status_mapping', {})
-        return status_mapping.get(status, status)
-    
-    def _standardize_address_type(self, value: str) -> str:
-        """Standardize address type"""
-        return value.strip().upper()
-    
-    def _parse_date(self, value: str) -> Optional[str]:
-        """Parse and standardize date"""
-        if not value:
-            return None
-        
-        # Try multiple date formats
-        date_formats = [
-            '%Y-%m-%d',
-            '%m/%d/%Y',
-            '%d/%m/%Y',
-            '%Y-%m-%d %H:%M:%S',
-            '%m/%d/%Y %H:%M:%S'
+        # Select relevant customer fields for enrichment
+        customer_fields = [
+            'customer_id', 'first_name', 'last_name', 
+            'email', 'phone', 'status', 'registration_date'
         ]
         
-        for fmt in date_formats:
-            try:
-                dt = datetime.strptime(value.strip(), fmt)
-                return dt.strftime('%Y-%m-%d')
-            except ValueError:
-                continue
+        customers_subset = customers_df[customer_fields].copy()
         
-        logger.warning(f"Could not parse date: {value}")
-        return None
-
-
-def transform_data(extracted_data: Dict, config: Dict) -> Dict:
-    """
-    Main transformation function
-    
-    Args:
-        extracted_data: Dictionary containing extracted customers and addresses
-        config: Configuration dictionary
+        # Perform left join to preserve all addresses
+        enriched_df = addresses_df.merge(
+            customers_subset,
+            on='customer_id',
+            how='left',
+            suffixes=('', '_customer')
+        )
         
-    Returns:
-        Dictionary containing transformed valid and invalid records
-    """
-    transformer = CustomerDataTransformer(config)
+        # Flag addresses without matching customer
+        enriched_df['customer_found'] = enriched_df['first_name'].notna()
+        
+        orphaned_count = (~enriched_df['customer_found']).sum()
+        if orphaned_count > 0:
+            logger.warning(f"Found {orphaned_count} addresses without matching customer records")
+        
+        logger.info(f"Enrichment complete: {len(enriched_df)} records")
+        return enriched_df
     
-    customer_results = transformer.transform_customers(
-        extracted_data.get('customers', [])
-    )
+    def standardize_address_format(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Standardize address formatting (trim, uppercase where appropriate).
+        
+        Args:
+            df: DataFrame with address fields
+            
+        Returns:
+            DataFrame with standardized addresses
+        """
+        logger.info("Standardizing address format")
+        
+        df = df.copy()
+        
+        # Trim whitespace from all string fields
+        string_fields = ['address_line1', 'address_line2', 'city', 'state', 'country']
+        for field in string_fields:
+            if field in df.columns:
+                df[field] = df[field].str.strip()
+        
+        # Uppercase state and country codes
+        if 'state' in df.columns:
+            df['state'] = df['state'].str.upper()
+        if 'country' in df.columns:
+            df['country'] = df['country'].str.upper()
+        
+        # Title case for city names
+        if 'city' in df.columns:
+            df['city'] = df['city'].str.title()
+        
+        # Standardize zip code format (remove spaces, ensure proper format)
+        if 'zip_code' in df.columns:
+            df['zip_code'] = df['zip_code'].str.replace(' ', '').str.replace('-', '')
+            # Re-add hyphen for 9-digit US zip codes
+            us_mask = (df['country'] == 'US') & (df['zip_code'].str.len() == 9)
+            df.loc[us_mask, 'zip_code'] = (
+                df.loc[us_mask, 'zip_code'].str[:5] + '-' + 
+                df.loc[us_mask, 'zip_code'].str[5:]
+            )
+        
+        logger.info("Address standardization complete")
+        return df
     
-    address_results = transformer.transform_addresses(
-        extracted_data.get('addresses', [])
-    )
+    def add_audit_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add audit fields for tracking transformations.
+        
+        Args:
+            df: DataFrame to add audit fields to
+            
+        Returns:
+            DataFrame with audit fields
+        """
+        df = df.copy()
+        
+        current_timestamp = datetime.now()
+        df['transform_timestamp'] = current_timestamp
+        df['transform_version'] = self.config.get('version', '1.0.0')
+        
+        return df
     
-    return {
-        'customers': customer_results,
-        'addresses': address_results
-    }
+    def transform_addresses(
+        self, 
+        addresses_df: pd.DataFrame, 
+        customers_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Execute full transformation pipeline for address data.
+        
+        Args:
+            addresses_df: Raw address data
+            customers_df: Raw customer data
+            
+        Returns:
+            Tuple of (transformed addresses, error records)
+        """
+        logger.info("Starting address transformation pipeline")
+        
+        try:
+            # Step 1: Validate address types
+            df = self.validate_address_type(addresses_df)
+            
+            # Step 2: Validate geography
+            df = self.validate_geography(df)
+            
+            # Step 3: Standardize address format
+            df = self.standardize_address_format(df)
+            
+            # Step 4: Set primary address flags
+            df = self.set_primary_address_flags(df)
+            
+            # Step 5: Enrich with customer data
+            df = self.enrich_with_customer_data(df, customers_df)
+            
+            # Step 6: Add audit fields
+            df = self.add_audit_fields(df)
+            
+            # Separate valid and error records
+            validation_columns = [
+                'address_type_valid', 'country_valid', 
+                'state_valid', 'zip_code_valid', 'customer_found'
+            ]
+            
+            df['all_validations_passed'] = df[validation_columns].all(axis=1)
+            
+            valid_df = df[df['all_validations_passed']].copy()
+            error_df = df[~df['all_validations_passed']].copy()
+            
+            logger.info(f"Transformation complete: {len(valid_df)} valid, {len(error_df)} error records")
+            
+            return valid_df, error_df
+            
+        except Exception as e:
+            logger.error(f"Transformation pipeline failed: {e}")
+            raise
