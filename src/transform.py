@@ -1,380 +1,372 @@
 """
-Transform customer master data with type conversions, null handling,
-and address standardization.
+Customer Master Data Transformation Module
+Applies business rules and data quality transformations
 """
-
-import re
-from typing import Dict, Any, Optional, List
-from datetime import datetime
 import logging
+import re
+from typing import Dict, List, Optional
+from datetime import datetime
+from email_validator import validate_email, EmailNotValidError
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DataTypeConverter:
-    """Handles data type conversions for customer data."""
+class CustomerDataTransformer:
+    """Handles transformation of customer master data"""
     
-    @staticmethod
-    def to_string(value: Any, max_length: Optional[int] = None) -> Optional[str]:
-        """Convert value to string with optional length constraint."""
-        if value is None or value == '':
-            return None
+    def __init__(self, config: Dict):
+        """
+        Initialize transformer with configuration
         
-        str_value = str(value).strip()
-        
-        if max_length and len(str_value) > max_length:
-            logger.warning(f"String truncated from {len(str_value)} to {max_length} chars")
-            return str_value[:max_length]
-        
-        return str_value if str_value else None
-    
-    @staticmethod
-    def to_date(value: Any, format_str: str = '%Y-%m-%d %H:%M:%S') -> Optional[str]:
-        """Convert value to ISO date string."""
-        if value is None or value == '':
-            return None
-        
-        try:
-            if isinstance(value, datetime):
-                return value.isoformat()
-            
-            if isinstance(value, str):
-                dt = datetime.strptime(value.strip(), format_str)
-                return dt.isoformat()
-            
-            return None
-        except ValueError as e:
-            logger.error(f"Date conversion error for value '{value}': {e}")
-            return None
-    
-    @staticmethod
-    def to_integer(value: Any) -> Optional[int]:
-        """Convert value to integer."""
-        if value is None or value == '':
-            return None
-        
-        try:
-            return int(float(str(value).strip()))
-        except (ValueError, TypeError) as e:
-            logger.error(f"Integer conversion error for value '{value}': {e}")
-            return None
-    
-    @staticmethod
-    def to_decimal(value: Any, precision: int = 10, scale: int = 2) -> Optional[float]:
-        """Convert value to decimal with specified precision and scale."""
-        if value is None or value == '':
-            return None
-        
-        try:
-            decimal_value = float(str(value).strip())
-            return round(decimal_value, scale)
-        except (ValueError, TypeError) as e:
-            logger.error(f"Decimal conversion error for value '{value}': {e}")
-            return None
-
-
-class NullHandler:
-    """Handles null values and default replacements."""
-    
-    @staticmethod
-    def handle_null(value: Any, default: Any = None, null_values: List[str] = None) -> Any:
-        """Replace null or empty values with default."""
-        if null_values is None:
-            null_values = ['', 'NULL', 'null', 'None', 'N/A', 'NA']
-        
-        if value is None:
-            return default
-        
-        if isinstance(value, str) and value.strip() in null_values:
-            return default
-        
-        return value
-    
-    @staticmethod
-    def coalesce(*values: Any) -> Any:
-        """Return first non-null value."""
-        for value in values:
-            if value is not None and value != '':
-                return value
-        return None
-
-
-class AddressStandardizer:
-    """Standardizes address data."""
-    
-    # US state abbreviations mapping
-    STATE_ABBREV = {
-        'ALABAMA': 'AL', 'ALASKA': 'AK', 'ARIZONA': 'AZ', 'ARKANSAS': 'AR',
-        'CALIFORNIA': 'CA', 'COLORADO': 'CO', 'CONNECTICUT': 'CT', 'DELAWARE': 'DE',
-        'FLORIDA': 'FL', 'GEORGIA': 'GA', 'HAWAII': 'HI', 'IDAHO': 'ID',
-        'ILLINOIS': 'IL', 'INDIANA': 'IN', 'IOWA': 'IA', 'KANSAS': 'KS',
-        'KENTUCKY': 'KY', 'LOUISIANA': 'LA', 'MAINE': 'ME', 'MARYLAND': 'MD',
-        'MASSACHUSETTS': 'MA', 'MICHIGAN': 'MI', 'MINNESOTA': 'MN', 'MISSISSIPPI': 'MS',
-        'MISSOURI': 'MO', 'MONTANA': 'MT', 'NEBRASKA': 'NE', 'NEVADA': 'NV',
-        'NEW HAMPSHIRE': 'NH', 'NEW JERSEY': 'NJ', 'NEW MEXICO': 'NM', 'NEW YORK': 'NY',
-        'NORTH CAROLINA': 'NC', 'NORTH DAKOTA': 'ND', 'OHIO': 'OH', 'OKLAHOMA': 'OK',
-        'OREGON': 'OR', 'PENNSYLVANIA': 'PA', 'RHODE ISLAND': 'RI', 'SOUTH CAROLINA': 'SC',
-        'SOUTH DAKOTA': 'SD', 'TENNESSEE': 'TN', 'TEXAS': 'TX', 'UTAH': 'UT',
-        'VERMONT': 'VT', 'VIRGINIA': 'VA', 'WASHINGTON': 'WA', 'WEST VIRGINIA': 'WV',
-        'WISCONSIN': 'WI', 'WYOMING': 'WY'
-    }
-    
-    # Street type abbreviations
-    STREET_TYPES = {
-        'STREET': 'ST', 'AVENUE': 'AVE', 'BOULEVARD': 'BLVD', 'DRIVE': 'DR',
-        'ROAD': 'RD', 'LANE': 'LN', 'COURT': 'CT', 'CIRCLE': 'CIR',
-        'PLACE': 'PL', 'PARKWAY': 'PKWY', 'HIGHWAY': 'HWY', 'TRAIL': 'TRL'
-    }
-    
-    @classmethod
-    def standardize_state(cls, state: Optional[str]) -> Optional[str]:
-        """Standardize state to 2-letter abbreviation."""
-        if not state:
-            return None
-        
-        state_upper = state.strip().upper()
-        
-        # Already abbreviated
-        if len(state_upper) == 2 and state_upper.isalpha():
-            return state_upper
-        
-        # Convert full name to abbreviation
-        return cls.STATE_ABBREV.get(state_upper, state_upper)
-    
-    @classmethod
-    def standardize_zip(cls, zip_code: Optional[str]) -> Optional[str]:
-        """Standardize ZIP code format."""
-        if not zip_code:
-            return None
-        
-        # Remove all non-alphanumeric characters
-        clean_zip = re.sub(r'[^0-9]', '', str(zip_code).strip())
-        
-        if len(clean_zip) == 5:
-            return clean_zip
-        elif len(clean_zip) == 9:
-            return f"{clean_zip[:5]}-{clean_zip[5:]}"
-        elif len(clean_zip) > 5:
-            return clean_zip[:5]
-        
-        return clean_zip if clean_zip else None
-    
-    @classmethod
-    def standardize_address_line(cls, address: Optional[str]) -> Optional[str]:
-        """Standardize address line with common abbreviations."""
-        if not address:
-            return None
-        
-        address_upper = address.strip().upper()
-        
-        # Replace street types with abbreviations
-        for full_type, abbrev in cls.STREET_TYPES.items():
-            pattern = r'\b' + full_type + r'\b'
-            address_upper = re.sub(pattern, abbrev, address_upper)
-        
-        # Remove extra whitespace
-        address_upper = re.sub(r'\s+', ' ', address_upper)
-        
-        return address_upper.strip()
-    
-    @classmethod
-    def standardize_phone(cls, phone: Optional[str]) -> Optional[str]:
-        """Standardize phone number format."""
-        if not phone:
-            return None
-        
-        # Extract digits only
-        digits = re.sub(r'[^0-9]', '', str(phone).strip())
-        
-        if len(digits) == 10:
-            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-        elif len(digits) == 11 and digits[0] == '1':
-            return f"+1 ({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
-        
-        return digits if digits else None
-    
-    @classmethod
-    def standardize_country(cls, country: Optional[str]) -> Optional[str]:
-        """Standardize country code."""
-        if not country:
-            return None
-        
-        country_upper = country.strip().upper()
-        
-        # Map common country names to ISO codes
-        country_map = {
-            'UNITED STATES': 'US',
-            'USA': 'US',
-            'CANADA': 'CA',
-            'MEXICO': 'MX',
-            'UNITED KINGDOM': 'GB',
-            'UK': 'GB'
-        }
-        
-        return country_map.get(country_upper, country_upper[:2])
-
-
-class CustomerTransformer:
-    """Main transformer for customer master data."""
-    
-    def __init__(self, config: Dict[str, Any]):
+        Args:
+            config: Configuration dictionary containing transformation rules
+        """
         self.config = config
-        self.converter = DataTypeConverter()
-        self.null_handler = NullHandler()
-        self.address_std = AddressStandardizer()
-        self.stats = {
-            'processed': 0,
-            'errors': 0,
-            'nulls_handled': 0,
-            'addresses_standardized': 0
+        self.transform_config = config.get('transformation', {})
+        self.validation_rules = self.transform_config.get('validation_rules', {})
+        self.default_values = self.transform_config.get('default_values', {})
+        
+    def transform_customers(self, customers: List[Dict]) -> Dict[str, List[Dict]]:
+        """
+        Transform customer records applying business rules
+        
+        Args:
+            customers: List of raw customer dictionaries
+            
+        Returns:
+            Dictionary with 'valid' and 'invalid' customer lists
+        """
+        logger.info(f"Transforming {len(customers)} customer records")
+        
+        valid_customers = []
+        invalid_customers = []
+        
+        for customer in customers:
+            try:
+                transformed = self._transform_customer(customer)
+                
+                # Validate transformed record
+                validation_result = self._validate_customer(transformed)
+                
+                if validation_result['is_valid']:
+                    valid_customers.append(transformed)
+                else:
+                    transformed['validation_errors'] = validation_result['errors']
+                    invalid_customers.append(transformed)
+                    logger.warning(
+                        f"Customer {customer.get('customer_id')} failed validation: "
+                        f"{validation_result['errors']}"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Error transforming customer {customer.get('customer_id')}: {e}")
+                customer['transformation_error'] = str(e)
+                invalid_customers.append(customer)
+        
+        logger.info(
+            f"Transformation complete: {len(valid_customers)} valid, "
+            f"{len(invalid_customers)} invalid"
+        )
+        
+        return {
+            'valid': valid_customers,
+            'invalid': invalid_customers
         }
     
-    def transform_customer(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform a single customer record."""
-        try:
-            transformed = {}
+    def transform_addresses(self, addresses: List[Dict]) -> Dict[str, List[Dict]]:
+        """
+        Transform address records
+        
+        Args:
+            addresses: List of raw address dictionaries
             
-            # Customer ID - required field
-            transformed['customer_id'] = self.converter.to_string(
-                record.get('customer_id'),
-                max_length=10
-            )
-            
-            if not transformed['customer_id']:
-                logger.error("Missing required customer_id")
-                self.stats['errors'] += 1
-                return None
-            
-            # Name fields with null handling
-            transformed['first_name'] = self.null_handler.handle_null(
-                self.converter.to_string(record.get('first_name'), max_length=50),
-                default=self.config.get('default_first_name', 'UNKNOWN')
-            )
-            
-            transformed['last_name'] = self.null_handler.handle_null(
-                self.converter.to_string(record.get('last_name'), max_length=50),
-                default=self.config.get('default_last_name', 'UNKNOWN')
-            )
-            
-            # Full name concatenation
-            transformed['full_name'] = f"{transformed['first_name']} {transformed['last_name']}"
-            
-            # Email with validation
-            email = self.converter.to_string(record.get('email'), max_length=100)
-            transformed['email'] = self._validate_email(email)
-            
-            # Phone standardization
-            transformed['phone'] = self.address_std.standardize_phone(
-                record.get('phone')
-            )
-            
-            # Address standardization
-            transformed['address_line1'] = self.address_std.standardize_address_line(
-                record.get('address_line1')
-            )
-            
-            transformed['address_line2'] = self.address_std.standardize_address_line(
-                record.get('address_line2')
-            )
-            
-            transformed['city'] = self.converter.to_string(
-                record.get('city'),
-                max_length=50
-            )
-            
-            transformed['state'] = self.address_std.standardize_state(
-                record.get('state')
-            )
-            
-            transformed['zip_code'] = self.address_std.standardize_zip(
-                record.get('zip_code')
-            )
-            
-            transformed['country'] = self.address_std.standardize_country(
-                record.get('country')
-            )
-            
-            # Date conversion
-            transformed['registration_date'] = self.converter.to_date(
-                record.get('registration_date'),
-                format_str=self.config.get('date_format', '%Y-%m-%d %H:%M:%S')
-            )
-            
-            # Status with default
-            transformed['status'] = self.null_handler.handle_null(
-                self.converter.to_string(record.get('status'), max_length=10),
-                default=self.config.get('default_status', 'ACTIVE')
-            )
-            
-            # Add audit fields
-            transformed['transformed_timestamp'] = datetime.utcnow().isoformat()
-            transformed['data_quality_score'] = self._calculate_quality_score(transformed)
-            
-            self.stats['processed'] += 1
-            
-            if any(v is None for k, v in transformed.items() 
-                   if k not in ['address_line2', 'email', 'phone']):
-                self.stats['nulls_handled'] += 1
-            
-            if transformed.get('state') or transformed.get('zip_code'):
-                self.stats['addresses_standardized'] += 1
-            
-            return transformed
-            
-        except Exception as e:
-            logger.error(f"Error transforming customer record: {e}")
-            self.stats['errors'] += 1
-            return None
+        Returns:
+            Dictionary with 'valid' and 'invalid' address lists
+        """
+        logger.info(f"Transforming {len(addresses)} address records")
+        
+        valid_addresses = []
+        invalid_addresses = []
+        
+        for address in addresses:
+            try:
+                transformed = self._transform_address(address)
+                
+                validation_result = self._validate_address(transformed)
+                
+                if validation_result['is_valid']:
+                    valid_addresses.append(transformed)
+                else:
+                    transformed['validation_errors'] = validation_result['errors']
+                    invalid_addresses.append(transformed)
+                    
+            except Exception as e:
+                logger.error(f"Error transforming address {address.get('address_id')}: {e}")
+                address['transformation_error'] = str(e)
+                invalid_addresses.append(address)
+        
+        logger.info(
+            f"Address transformation complete: {len(valid_addresses)} valid, "
+            f"{len(invalid_addresses)} invalid"
+        )
+        
+        return {
+            'valid': valid_addresses,
+            'invalid': invalid_addresses
+        }
     
-    def _validate_email(self, email: Optional[str]) -> Optional[str]:
-        """Validate email format."""
-        if not email:
+    def _transform_customer(self, customer: Dict) -> Dict:
+        """Apply transformations to a single customer record"""
+        transformed = customer.copy()
+        
+        # Standardize customer_id
+        transformed['customer_id'] = self._standardize_id(
+            transformed.get('customer_id', '')
+        )
+        
+        # Standardize names
+        transformed['first_name'] = self._standardize_name(
+            transformed.get('first_name', '')
+        )
+        transformed['last_name'] = self._standardize_name(
+            transformed.get('last_name', '')
+        )
+        
+        # Create full name
+        transformed['full_name'] = f"{transformed['first_name']} {transformed['last_name']}".strip()
+        
+        # Standardize email
+        transformed['email'] = self._standardize_email(
+            transformed.get('email', '')
+        )
+        
+        # Standardize phone
+        transformed['phone'] = self._standardize_phone(
+            transformed.get('phone', '')
+        )
+        
+        # Standardize address fields
+        transformed['address_line1'] = self._standardize_address(
+            transformed.get('address_line1', '')
+        )
+        transformed['address_line2'] = self._standardize_address(
+            transformed.get('address_line2', '')
+        )
+        transformed['city'] = self._standardize_name(
+            transformed.get('city', '')
+        )
+        
+        # Standardize state (uppercase)
+        transformed['state'] = transformed.get('state', '').strip().upper()
+        
+        # Standardize zip code
+        transformed['zip_code'] = self._standardize_zip(
+            transformed.get('zip_code', '')
+        )
+        
+        # Standardize country (uppercase)
+        transformed['country'] = transformed.get('country', '').strip().upper()
+        if not transformed['country']:
+            transformed['country'] = self.default_values.get('country', 'US')
+        
+        # Parse and standardize registration date
+        transformed['registration_date'] = self._parse_date(
+            transformed.get('registration_date', '')
+        )
+        
+        # Standardize status
+        transformed['status'] = self._standardize_status(
+            transformed.get('status', '')
+        )
+        
+        # Add transformation metadata
+        transformed['transform_timestamp'] = datetime.now().isoformat()
+        
+        return transformed
+    
+    def _transform_address(self, address: Dict) -> Dict:
+        """Apply transformations to a single address record"""
+        transformed = address.copy()
+        
+        # Standardize IDs
+        transformed['address_id'] = self._standardize_id(
+            transformed.get('address_id', '')
+        )
+        transformed['customer_id'] = self._standardize_id(
+            transformed.get('customer_id', '')
+        )
+        
+        # Standardize address type
+        transformed['address_type'] = self._standardize_address_type(
+            transformed.get('address_type', '')
+        )
+        
+        # Add transformation metadata
+        transformed['transform_timestamp'] = datetime.now().isoformat()
+        
+        return transformed
+    
+    def _validate_customer(self, customer: Dict) -> Dict:
+        """Validate transformed customer record"""
+        errors = []
+        
+        # Validate customer_id
+        if not customer.get('customer_id'):
+            errors.append("customer_id is required")
+        elif len(customer['customer_id']) > 10:
+            errors.append("customer_id exceeds maximum length of 10")
+        
+        # Validate names
+        if not customer.get('first_name'):
+            errors.append("first_name is required")
+        if not customer.get('last_name'):
+            errors.append("last_name is required")
+        
+        # Validate email
+        if customer.get('email'):
+            try:
+                validate_email(customer['email'])
+            except EmailNotValidError:
+                errors.append("email format is invalid")
+        elif self.validation_rules.get('email_required', False):
+            errors.append("email is required")
+        
+        # Validate phone
+        if customer.get('phone'):
+            if not re.match(r'^\d{10}$', customer['phone']):
+                errors.append("phone must be 10 digits")
+        
+        # Validate state
+        if customer.get('state'):
+            valid_states = self.validation_rules.get('valid_states', [])
+            if valid_states and customer['state'] not in valid_states:
+                errors.append(f"state '{customer['state']}' is not valid")
+        
+        # Validate zip code
+        if customer.get('zip_code'):
+            if not re.match(r'^\d{5}(-\d{4})?$', customer['zip_code']):
+                errors.append("zip_code format is invalid")
+        
+        # Validate country
+        if customer.get('country'):
+            valid_countries = self.validation_rules.get('valid_countries', [])
+            if valid_countries and customer['country'] not in valid_countries:
+                errors.append(f"country '{customer['country']}' is not valid")
+        
+        # Validate status
+        valid_statuses = self.validation_rules.get('valid_statuses', ['ACTIVE', 'INACTIVE', 'SUSPENDED'])
+        if customer.get('status') not in valid_statuses:
+            errors.append(f"status must be one of {valid_statuses}")
+        
+        return {
+            'is_valid': len(errors) == 0,
+            'errors': errors
+        }
+    
+    def _validate_address(self, address: Dict) -> Dict:
+        """Validate transformed address record"""
+        errors = []
+        
+        if not address.get('address_id'):
+            errors.append("address_id is required")
+        
+        if not address.get('customer_id'):
+            errors.append("customer_id is required")
+        
+        valid_types = self.validation_rules.get('valid_address_types', ['BILLING', 'SHIPPING', 'MAILING'])
+        if address.get('address_type') not in valid_types:
+            errors.append(f"address_type must be one of {valid_types}")
+        
+        return {
+            'is_valid': len(errors) == 0,
+            'errors': errors
+        }
+    
+    def _standardize_id(self, value: str) -> str:
+        """Standardize ID field"""
+        return value.strip().upper()
+    
+    def _standardize_name(self, value: str) -> str:
+        """Standardize name field (title case)"""
+        return value.strip().title()
+    
+    def _standardize_email(self, value: str) -> str:
+        """Standardize email (lowercase)"""
+        return value.strip().lower()
+    
+    def _standardize_phone(self, value: str) -> str:
+        """Standardize phone number (digits only)"""
+        return re.sub(r'\D', '', value)
+    
+    def _standardize_address(self, value: str) -> str:
+        """Standardize address field"""
+        return value.strip().title()
+    
+    def _standardize_zip(self, value: str) -> str:
+        """Standardize zip code"""
+        # Remove spaces and hyphens, then reformat
+        digits = re.sub(r'[^\d]', '', value)
+        if len(digits) == 9:
+            return f"{digits[:5]}-{digits[5:]}"
+        return digits[:5]
+    
+    def _standardize_status(self, value: str) -> str:
+        """Standardize status field"""
+        status = value.strip().upper()
+        status_mapping = self.transform_config.get('status_mapping', {})
+        return status_mapping.get(status, status)
+    
+    def _standardize_address_type(self, value: str) -> str:
+        """Standardize address type"""
+        return value.strip().upper()
+    
+    def _parse_date(self, value: str) -> Optional[str]:
+        """Parse and standardize date"""
+        if not value:
             return None
         
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        # Try multiple date formats
+        date_formats = [
+            '%Y-%m-%d',
+            '%m/%d/%Y',
+            '%d/%m/%Y',
+            '%Y-%m-%d %H:%M:%S',
+            '%m/%d/%Y %H:%M:%S'
+        ]
         
-        if re.match(email_pattern, email):
-            return email.lower()
+        for fmt in date_formats:
+            try:
+                dt = datetime.strptime(value.strip(), fmt)
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
         
-        logger.warning(f"Invalid email format: {email}")
+        logger.warning(f"Could not parse date: {value}")
         return None
-    
-    def _calculate_quality_score(self, record: Dict[str, Any]) -> float:
-        """Calculate data quality score (0-100)."""
-        total_fields = 0
-        filled_fields = 0
-        
-        critical_fields = ['customer_id', 'first_name', 'last_name', 'email']
-        optional_fields = ['phone', 'address_line1', 'city', 'state', 'zip_code']
-        
-        for field in critical_fields:
-            total_fields += 2  # Critical fields weighted 2x
-            if record.get(field):
-                filled_fields += 2
-        
-        for field in optional_fields:
-            total_fields += 1
-            if record.get(field):
-                filled_fields += 1
-        
-        return round((filled_fields / total_fields) * 100, 2) if total_fields > 0 else 0.0
-    
-    def get_statistics(self) -> Dict[str, int]:
-        """Get transformation statistics."""
-        return self.stats.copy()
 
 
-def transform_customer_batch(records: List[Dict[str, Any]], config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Transform a batch of customer records."""
-    transformer = CustomerTransformer(config)
-    transformed_records = []
+def transform_data(extracted_data: Dict, config: Dict) -> Dict:
+    """
+    Main transformation function
     
-    for record in records:
-        transformed = transformer.transform_customer(record)
-        if transformed:
-            transformed_records.append(transformed)
+    Args:
+        extracted_data: Dictionary containing extracted customers and addresses
+        config: Configuration dictionary
+        
+    Returns:
+        Dictionary containing transformed valid and invalid records
+    """
+    transformer = CustomerDataTransformer(config)
     
-    logger.info(f"Transformation statistics: {transformer.get_statistics()}")
+    customer_results = transformer.transform_customers(
+        extracted_data.get('customers', [])
+    )
     
-    return transformed_records
+    address_results = transformer.transform_addresses(
+        extracted_data.get('addresses', [])
+    )
+    
+    return {
+        'customers': customer_results,
+        'addresses': address_results
+    }
