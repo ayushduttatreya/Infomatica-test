@@ -1,26 +1,83 @@
-services:
-  etl-runner:
-    build: .
-    container_name: informatica-etl-runner
-    environment:
-      - BATCH_ID=BATCH_DOCKER_001
-      - LOG_LEVEL=INFO
-      - SOURCE_DIR=/app/source_data
-      - TARGET_DIR=/app/target_data
-      - MAPPING_FILE=/app/mappings/informatica_repository.xml
-    volumes:
-      - ./source_data:/app/source_data:ro
-      - ./target_data:/app/target_data
-      - ./mappings:/app/mappings:ro
+version: '3.8'
 
-  test-validator:
-    build: .
-    container_name: informatica-test-validator
-    depends_on:
-      etl-runner:
-        condition: service_completed_successfully
+services:
+  nifi:
+    image: apache/nifi:1.23.2
+    container_name: nifi
+    ports:
+      - "8443:8443"
+      - "8080:8080"
     environment:
-      - TARGET_DIR=/app/target_data
+      - SINGLE_USER_CREDENTIALS_USERNAME=admin
+      - SINGLE_USER_CREDENTIALS_PASSWORD=ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB
+      - NIFI_WEB_HTTP_PORT=8080
+      - NIFI_WEB_HTTPS_PORT=8443
+      - NIFI_JVM_HEAP_INIT=2g
+      - NIFI_JVM_HEAP_MAX=4g
     volumes:
-      - ./target_data:/app/target_data:ro
-    command: ["python", "/app/scripts/validate_output.py"]
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - nifi_database_repository:/opt/nifi/nifi-current/database_repository
+      - nifi_flowfile_repository:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_content_repository:/opt/nifi/nifi-current/content_repository
+      - nifi_provenance_repository:/opt/nifi/nifi-current/provenance_repository
+      - nifi_state:/opt/nifi/nifi-current/state
+      - nifi_logs:/opt/nifi/nifi-current/logs
+      - ./data:/opt/nifi/data
+      - ./templates:/opt/nifi/templates
+    networks:
+      - nifi_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/nifi"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nifi_postgres
+    environment:
+      - POSTGRES_USER=nifi_user
+      - POSTGRES_PASSWORD=nifi_password
+      - POSTGRES_DB=nifi_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - nifi_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nifi_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nifi_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - nifi_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  nifi_conf:
+  nifi_database_repository:
+  nifi_flowfile_repository:
+  nifi_content_repository:
+  nifi_provenance_repository:
+  nifi_state:
+  nifi_logs:
+  postgres_data:
+  redis_data:
+
+networks:
+  nifi_network:
+    driver: bridge
