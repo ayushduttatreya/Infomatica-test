@@ -1,267 +1,138 @@
-#!/usr/bin/env python3
 """
-Main entry point for the info-to-nifi project.
-Discovers and executes all pipeline modules in the src directory.
+main.py — XClarity ETL migration runner.
+
+Discovers and executes all src/*.py modules in dependency order:
+
+  Phase 0 (Infrastructure):
+    controller_services  — register NiFi Controller Services + Redis pre-load
+    schemas              — register all Avro schemas
+
+  Phase 1 (Foundation flows — HR + Operations first):
+    hr
+    operations
+
+  Phase 2 (Core business logic):
+    finance
+    sales
+
+  Phase 3 (Complex transforms):
+    customer
+    product
+
+Each module must expose a `run()` function.
+Errors in any module are logged and re-raised to halt the pipeline.
 """
 
-import os
-import sys
-import importlib.util
+import importlib
 import logging
+import sys
+import time
 from pathlib import Path
-from typing import List, Dict, Any
-import traceback
+from typing import Callable
 
-# Configure logging
+from dotenv import load_dotenv
+
+# Load .env file if present (NIFI_HOST, REDIS_HOST, JDBC_URL, etc.)
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('pipeline.log')
-    ]
+    ],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
+
+# ---------------------------------------------------------------------------
+# Execution order following spec.md §8 Timeline + §3 Process Group Dependencies
+# ---------------------------------------------------------------------------
+EXECUTION_ORDER: list[str] = [
+    # Phase 0: shared infrastructure
+    "controller_services",
+    "schemas",
+    # Phase 1: simple, standalone domains
+    "hr",
+    "operations",
+    # Phase 2: core business logic
+    "finance",
+    "sales",
+    # Phase 3: complex transforms (depend on Customer → Sales → Product)
+    "customer",
+    "product",
+]
 
 
-class PipelineRunner:
-    """Discovers and runs all pipeline modules."""
-    
-    def __init__(self, src_dir: str = "src"):
-        self.src_dir = Path(src_dir)
-        self.modules: List[Dict[str, Any]] = []
-        
-    def discover_modules(self) -> None:
-        """Discover all Python modules in the src directory."""
-        if not self.src_dir.exists():
-            logger.error(f"Source directory {self.src_dir} does not exist")
-            return
-            
-        logger.info(f"Discovering modules in {self.src_dir}")
-        
-        for py_file in self.src_dir.rglob("*.py"):
-            if py_file.name.startswith("__"):
-                continue
-                
-            module_name = py_file.stem
-            relative_path = py_file.relative_to(self.src_dir.parent)
-            
-            self.modules.append({
-                "name": module_name,
-                "path": py_file,
-                "relative_path": relative_path
-            })
-            
-        logger.info(f"Discovered {len(self.modules)} modules")
-        
-    def load_module(self, module_info: Dict[str, Any]) -> Any:
-        """Load a Python module dynamically."""
+def _load_module(module_name: str) -> Callable[[], None]:
+    """Import src/<module_name>.py and return its run() callable."""
+    # Ensure src/ is on the path
+    src_path = Path(__file__).parent / "src"
+    if str(src_path) not in sys.path:
+        sys.path.insert(0, str(src_path))
+
+    logger.info("Importing module: %s", module_name)
+    mod = importlib.import_module(module_name)
+    if not hasattr(mod, "run"):
+        raise AttributeError(f"Module 'src/{module_name}.py' does not expose a run() function.")
+    return mod.run
+
+
+def discover_modules() -> list[str]:
+    """
+    Return the ordered list of src/*.py module names (excluding __init__).
+    Modules not in EXECUTION_ORDER are appended at the end in alphabetical order.
+    """
+    src_path = Path(__file__).parent / "src"
+    all_modules = sorted(
+        p.stem for p in src_path.glob("*.py")
+        if p.stem != "__init__" and not p.stem.startswith("_")
+    )
+    ordered = [m for m in EXECUTION_ORDER if m in all_modules]
+    extra = [m for m in all_modules if m not in EXECUTION_ORDER]
+    return ordered + extra
+
+
+def run_all() -> None:
+    """Discover and run all src modules in dependency order."""
+    modules = discover_modules()
+    logger.info("Discovered %d modules: %s", len(modules), modules)
+
+    results: dict[str, str] = {}
+    overall_start = time.monotonic()
+
+    for module_name in modules:
+        t0 = time.monotonic()
+        logger.info("=" * 60)
+        logger.info("Starting module: %s", module_name)
         try:
-            spec = importlib.util.spec_from_file_location(
-                module_info["name"],
-                module_info["path"]
+            run_fn = _load_module(module_name)
+            run_fn()
+            elapsed = time.monotonic() - t0
+            results[module_name] = f"OK ({elapsed:.1f}s)"
+            logger.info("Finished module: %s  [%.1fs]", module_name, elapsed)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            results[module_name] = f"FAILED ({elapsed:.1f}s): {exc}"
+            logger.error(
+                "Module %s FAILED after %.1fs: %s",
+                module_name, elapsed, exc,
+                exc_info=True,
             )
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_info["name"]] = module
-                spec.loader.exec_module(module)
-                return module
-        except Exception as e:
-            logger.error(f"Failed to load module {module_info['name']}: {e}")
-            logger.debug(traceback.format_exc())
-        return None
-        
-    def execute_module(self, module: Any, module_name: str) -> bool:
-        """Execute a module's main function or class."""
-        try:
-            # Try to find and execute main function
-            if hasattr(module, "main"):
-                logger.info(f"Executing main() in {module_name}")
-                result = module.main()
-                logger.info(f"Module {module_name} completed with result: {result}")
-                return True
-                
-            # Try to find and execute run function
-            elif hasattr(module, "run"):
-                logger.info(f"Executing run() in {module_name}")
-                result = module.run()
-                logger.info(f"Module {module_name} completed with result: {result}")
-                return True
-                
-            # Try to find and instantiate a processor class
-            elif hasattr(module, "Processor"):
-                logger.info(f"Instantiating Processor class in {module_name}")
-                processor = module.Processor()
-                if hasattr(processor, "process"):
-                    result = processor.process()
-                    logger.info(f"Module {module_name} completed with result: {result}")
-                    return True
-                    
-            # Try to execute extract, transform, load pattern
-            elif hasattr(module, "extract") or hasattr(module, "transform") or hasattr(module, "load"):
-                logger.info(f"Executing ETL pattern in {module_name}")
-                
-                data = None
-                if hasattr(module, "extract"):
-                    logger.info(f"Running extract in {module_name}")
-                    data = module.extract()
-                    
-                if hasattr(module, "transform") and data is not None:
-                    logger.info(f"Running transform in {module_name}")
-                    data = module.transform(data)
-                    
-                if hasattr(module, "load") and data is not None:
-                    logger.info(f"Running load in {module_name}")
-                    module.load(data)
-                    
-                logger.info(f"Module {module_name} ETL completed")
-                return True
-                
-            else:
-                logger.warning(f"No executable entry point found in {module_name}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error executing module {module_name}: {e}")
-            logger.debug(traceback.format_exc())
-            return False
-            
-    def run(self) -> None:
-        """Run all discovered modules."""
-        logger.info("=" * 80)
-        logger.info("Starting info-to-nifi Pipeline Runner")
-        logger.info("=" * 80)
-        
-        self.discover_modules()
-        
-        if not self.modules:
-            logger.warning("No modules found to execute")
-            return
-            
-        # Sort modules to ensure framework modules run first
-        framework_modules = [m for m in self.modules if "framework" in str(m["path"])]
-        other_modules = [m for m in self.modules if "framework" not in str(m["path"])]
-        
-        execution_order = framework_modules + other_modules
-        
-        success_count = 0
-        failure_count = 0
-        skipped_count = 0
-        
-        for module_info in execution_order:
-            logger.info("-" * 80)
-            logger.info(f"Processing: {module_info['relative_path']}")
-            
-            module = self.load_module(module_info)
-            if module is None:
-                failure_count += 1
-                continue
-                
-            executed = self.execute_module(module, module_info["name"])
-            if executed:
-                success_count += 1
-            else:
-                skipped_count += 1
-                
-        logger.info("=" * 80)
-        logger.info("Pipeline Execution Summary")
-        logger.info(f"Total modules: {len(self.modules)}")
-        logger.info(f"Successfully executed: {success_count}")
-        logger.info(f"Failed: {failure_count}")
-        logger.info(f"Skipped: {skipped_count}")
-        logger.info("=" * 80)
-
-
-def check_environment() -> bool:
-    """Check if the required environment is ready."""
-    logger.info("Checking environment...")
-    
-    # Check if config.yaml exists
-    if not Path("config.yaml").exists():
-        logger.warning("config.yaml not found, creating default configuration")
-        create_default_config()
-        
-    # Check if data directory exists
-    data_dir = Path("data")
-    if not data_dir.exists():
-        logger.info("Creating data directory")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        
-    # Check if templates directory exists
-    templates_dir = Path("templates")
-    if not templates_dir.exists():
-        logger.info("Creating templates directory")
-        templates_dir.mkdir(parents=True, exist_ok=True)
-        
-    return True
-
-
-def create_default_config() -> None:
-    """Create a default config.yaml file."""
-    default_config = """
-# Apache NiFi Configuration
-nifi:
-  host: localhost
-  port: 8080
-  username: admin
-  password: ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB
-  use_ssl: false
-
-# Database Configuration
-database:
-  host: localhost
-  port: 5432
-  name: nifi_db
-  user: nifi_user
-  password: nifi_password
-
-# Redis Configuration
-redis:
-  host: localhost
-  port: 6379
-  db: 0
-
-# Logging Configuration
-logging:
-  level: INFO
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-# Pipeline Configuration
-pipeline:
-  batch_size: 1000
-  retry_attempts: 3
-  timeout: 300
-"""
-    
-    with open("config.yaml", "w") as f:
-        f.write(default_config)
-    logger.info("Created default config.yaml")
-
-
-def main():
-    """Main entry point."""
-    try:
-        logger.info("info-to-nifi Pipeline Starting...")
-        
-        # Check environment
-        if not check_environment():
-            logger.error("Environment check failed")
+            # Halt on failure — downstream modules depend on upstream completion
+            _print_summary(results, time.monotonic() - overall_start)
             sys.exit(1)
-            
-        # Run pipeline
-        runner = PipelineRunner()
-        runner.run()
-        
-        logger.info("Pipeline execution completed")
-        
-    except KeyboardInterrupt:
-        logger.info("Pipeline interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        logger.debug(traceback.format_exc())
-        sys.exit(1)
+
+    _print_summary(results, time.monotonic() - overall_start)
+
+
+def _print_summary(results: dict[str, str], total_seconds: float) -> None:
+    logger.info("=" * 60)
+    logger.info("EXECUTION SUMMARY  (total: %.1fs)", total_seconds)
+    logger.info("=" * 60)
+    for module, status in results.items():
+        logger.info("  %-30s  %s", module, status)
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    run_all()
