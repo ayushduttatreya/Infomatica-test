@@ -1,131 +1,146 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# start.sh – XClarity ETL NiFi Migration
+# Starts Docker Compose services then invokes main.py
+#
+# Usage:
+#   chmod +x start.sh
+#   ./start.sh [--nifi-url http://localhost:8080] [--modules all]
+# =============================================================================
 
-# start.sh - Linux/Mac startup script for info-to-nifi project
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NIFI_URL="${NIFI_URL:-http://localhost:8080}"
+MODULES="${MODULES:-all}"
+NIFI_READY_TIMEOUT=180  # seconds
 
-echo "=========================================="
-echo "info-to-nifi Pipeline Startup Script"
-echo "=========================================="
+log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die()  { log "ERROR: $*" >&2; exit 1; }
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# ---------------------------------------------------------------------------
+# 1. Pre-flight checks
+# ---------------------------------------------------------------------------
+command -v docker  >/dev/null 2>&1 || die "docker not found on PATH"
+command -v python3 >/dev/null 2>&1 || die "python3 not found on PATH"
 
-# Check if Docker is installed
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}Error: Docker is not installed${NC}"
-    echo "Please install Docker from https://docs.docker.com/get-docker/"
-    exit 1
-fi
-
-# Check if Docker Compose is installed
-if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
-    echo -e "${RED}Error: Docker Compose is not installed${NC}"
-    echo "Please install Docker Compose from https://docs.docker.com/compose/install/"
-    exit 1
-fi
-
-# Check if Python 3 is installed
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}Error: Python 3 is not installed${NC}"
-    echo "Please install Python 3 from https://www.python.org/downloads/"
-    exit 1
-fi
-
-echo -e "${GREEN}All prerequisites are installed${NC}"
-echo ""
-
-# Create necessary directories
-echo "Creating necessary directories..."
-mkdir -p data templates logs
-
-# Start Docker Compose services
-echo ""
-echo "Starting Docker Compose services..."
-echo "This may take a few minutes on first run..."
-
-if docker compose version &> /dev/null; then
-    docker compose up -d
+# Detect docker compose (v2 plugin or standalone)
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
 else
-    docker-compose up -d
+    die "Neither 'docker compose' nor 'docker-compose' found"
 fi
 
-# Wait for services to be healthy
-echo ""
-echo "Waiting for services to be ready..."
-echo "NiFi UI will be available at: http://localhost:8080/nifi"
-echo "Username: admin"
-echo "Password: ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB"
-echo ""
+log "Using compose command: $COMPOSE_CMD"
 
-# Wait for NiFi to be ready
-MAX_WAIT=180
-WAIT_TIME=0
-while [ $WAIT_TIME -lt $MAX_WAIT ]; do
-    if curl -s -f http://localhost:8080/nifi > /dev/null 2>&1; then
-        echo -e "${GREEN}NiFi is ready!${NC}"
-        break
+# ---------------------------------------------------------------------------
+# 2. Create directories expected by docker-compose.yml
+# ---------------------------------------------------------------------------
+mkdir -p "$SCRIPT_DIR/data/inbound"
+mkdir -p "$SCRIPT_DIR/data/outbound"
+mkdir -p "$SCRIPT_DIR/data/error"
+mkdir -p "$SCRIPT_DIR/drivers"
+mkdir -p "$SCRIPT_DIR/sql"
+mkdir -p "$SCRIPT_DIR/monitoring"
+mkdir -p "$SCRIPT_DIR/schemas"
+
+# Provide a minimal init.sql if not present
+if [ ! -f "$SCRIPT_DIR/sql/init.sql" ]; then
+    log "Generating minimal sql/init.sql..."
+    cat > "$SCRIPT_DIR/sql/init.sql" <<'SQL'
+-- XClarity ETL lookup tables
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    from_currency VARCHAR(5),
+    to_currency   VARCHAR(5),
+    rate_date     DATE,
+    exchange_rate NUMERIC(12,4),
+    PRIMARY KEY (from_currency, to_currency, rate_date)
+);
+
+CREATE TABLE IF NOT EXISTS product_categories (
+    category_id        VARCHAR(10) PRIMARY KEY,
+    category_name      VARCHAR(50),
+    parent_category_id VARCHAR(10),
+    level              INTEGER,
+    description        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tgt_customer_scd2 (
+    customer_id    VARCHAR(10),
+    first_name     VARCHAR(50),
+    last_name      VARCHAR(50),
+    email          VARCHAR(100),
+    phone          VARCHAR(20),
+    status         VARCHAR(10),
+    effective_date TIMESTAMP,
+    end_date       TIMESTAMP,
+    is_current     CHAR(1),
+    PRIMARY KEY (customer_id, effective_date)
+);
+SQL
+fi
+
+# Provide a minimal prometheus config if not present
+mkdir -p "$SCRIPT_DIR/monitoring/grafana/provisioning"
+if [ ! -f "$SCRIPT_DIR/monitoring/prometheus.yml" ]; then
+    log "Generating minimal monitoring/prometheus.yml..."
+    cat > "$SCRIPT_DIR/monitoring/prometheus.yml" <<'YAML'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "nifi"
+    static_configs:
+      - targets:
+          - "nifi-1:9092"
+          - "nifi-2:9092"
+          - "nifi-3:9092"
+YAML
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Start Docker Compose
+# ---------------------------------------------------------------------------
+log "Starting Docker Compose services..."
+cd "$SCRIPT_DIR"
+$COMPOSE_CMD up -d --remove-orphans
+
+log "Waiting up to ${NIFI_READY_TIMEOUT}s for NiFi to be ready at $NIFI_URL ..."
+ELAPSED=0
+until curl -sf "$NIFI_URL/nifi/" >/dev/null 2>&1; do
+    if [ "$ELAPSED" -ge "$NIFI_READY_TIMEOUT" ]; then
+        die "NiFi did not become ready within ${NIFI_READY_TIMEOUT}s. Check: docker compose logs nifi-1"
     fi
-    echo "Waiting for NiFi to start... ($WAIT_TIME/$MAX_WAIT seconds)"
-    sleep 10
-    WAIT_TIME=$((WAIT_TIME + 10))
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    log "  Still waiting... (${ELAPSED}s elapsed)"
 done
+log "NiFi is ready!"
 
-if [ $WAIT_TIME -ge $MAX_WAIT ]; then
-    echo -e "${YELLOW}Warning: NiFi did not start within expected time${NC}"
-    echo "You can check the status with: docker logs nifi"
-fi
+# ---------------------------------------------------------------------------
+# 4. Install Python dependencies
+# ---------------------------------------------------------------------------
+log "Installing Python dependencies from requirements.txt..."
+python3 -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt" \
+    || log "WARNING: pip install failed; continuing anyway"
 
-# Check if virtual environment exists
-if [ ! -d "venv" ]; then
-    echo ""
-    echo "Creating Python virtual environment..."
-    python3 -m venv venv
-fi
+# ---------------------------------------------------------------------------
+# 5. Run the migration
+# ---------------------------------------------------------------------------
+log "Invoking main.py (NIFI_URL=$NIFI_URL, MODULES=$MODULES)..."
+python3 "$SCRIPT_DIR/main.py" \
+    --nifi-url "$NIFI_URL" \
+    --modules  "$MODULES" \
+    "$@"
 
-# Activate virtual environment
-echo ""
-echo "Activating virtual environment..."
-source venv/bin/activate
-
-# Install/upgrade pip
-echo ""
-echo "Upgrading pip..."
-pip install --upgrade pip
-
-# Install requirements
-echo ""
-echo "Installing Python dependencies..."
-pip install -r requirements.txt
-
-# Run the pipeline
-echo ""
-echo "=========================================="
-echo "Starting Pipeline Execution"
-echo "=========================================="
-echo ""
-
-python3 main.py
-
-# Capture exit code
 EXIT_CODE=$?
-
-echo ""
-echo "=========================================="
-if [ $EXIT_CODE -eq 0 ]; then
-    echo -e "${GREEN}Pipeline completed successfully${NC}"
+if [ "$EXIT_CODE" -eq 0 ]; then
+    log "Migration deployment completed successfully."
 else
-    echo -e "${RED}Pipeline completed with errors (exit code: $EXIT_CODE)${NC}"
+    log "ERROR: main.py exited with code $EXIT_CODE. Check migration_run.log for details."
 fi
-echo "=========================================="
-echo ""
-echo "Docker services are still running."
-echo "To stop services, run: docker-compose down"
-echo "To view NiFi UI, visit: http://localhost:8080/nifi"
-echo "To view logs, run: docker logs nifi"
-echo ""
 
-exit $EXIT_CODE
+exit "$EXIT_CODE"
