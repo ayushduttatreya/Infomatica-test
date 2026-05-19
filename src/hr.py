@@ -1,32 +1,38 @@
 """
-HR Domain - Apache NiFi Process Group
-Migrated from Informatica PowerCenter XClarity_ETL
+hr.py — Apache NiFi Process Group builder for the HR domain.
 
-Covers tickets:
-  - Migrate HR Module: employee load, payroll, attendance, performance scoring,
-    turnover risk
-  - Migrate HR Module: employee load, payroll, attendance, performance scoring,
-    and turnover risk (sub-flows)
+Tickets covered:
+  - cd2ba728  HR Module: employee load, payroll, attendance, performance scoring, turnover risk
+  - 6a04ba45  HR Module sub-flows (m_employee_load, m_payroll, m_attendance_load,
+              m_performance_score, m_turnover_risk)
 
-Sources : SRC_EMPLOYEES, SRC_PAYROLL, SRC_ATTENDANCE, SRC_PERFORMANCE
-Targets : TGT_EMPLOYEES, TGT_PAYROLL, TGT_ATTENDANCE, TGT_PERF_SCORE, TGT_TURNOVER
+Informatica mappings replaced:
+  m_hr_employee_load, m_hr_payroll, m_hr_attendance,
+  m_hr_perf_score, m_hr_turnover
 """
 
+import json
 import logging
+import os
+from typing import Any
 
 import nipyapi
-from nipyapi import canvas
+from nipyapi import canvas, config
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+NIFI_HOST    = os.environ.get("NIFI_HOST",    "https://localhost:8443")
+INBOUND_DIR  = os.environ.get("INBOUND_DIR",  "/data/inbound/hr")
+OUTBOUND_DIR = os.environ.get("OUTBOUND_DIR", "/data/outbound/hr")
+ERROR_DIR    = os.environ.get("ERROR_DIR",    "/data/error/hr")
+
 
 # ---------------------------------------------------------------------------
-# Groovy script: Turnover risk calculation (DATE_DIFF tenure)
+# Groovy scripts
 # ---------------------------------------------------------------------------
 
-GROOVY_TURNOVER_RISK = """\
-import org.apache.commons.io.IOUtils
-import java.nio.charset.StandardCharsets
+TURNOVER_RISK_SCRIPT = r"""
 import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import java.time.LocalDate
@@ -36,347 +42,283 @@ def flowFile = session.get()
 if (!flowFile) return
 
 try {
-    def content = IOUtils.toString(session.read(flowFile), StandardCharsets.UTF_8)
-    def records = new JsonSlurper().parseText(content)
-    def today   = LocalDate.now()
+    def slurper = new JsonSlurper()
+    def record  = slurper.parseText(
+        new java.io.InputStreamReader(session.read(flowFile)).text)
 
-    records.each { rec ->
-        def hireDateStr    = rec.hire_date as String
-        def statusVal      = rec.status as String
-        def managerRating  = (rec.manager_rating ?: 0) as Double
+    def hireDateStr   = record.hire_date?.toString()?.substring(0, 10)
+    def empStatus     = record.status ?: ''
+    def managerRating = record.manager_rating ? record.manager_rating.toDouble() : 5.0
+    def tenureMonths  = 9999
 
-        def tenureMonths = 0
-        if (hireDateStr && hireDateStr != 'null') {
-            try {
-                def hireDate = LocalDate.parse(hireDateStr[0..9])
-                tenureMonths = ChronoUnit.MONTHS.between(hireDate, today)
-            } catch (Exception ignored) {}
-        }
-
-        def riskLevel = 'low'
-        if (statusVal?.equalsIgnoreCase('terminated')) {
-            riskLevel = 'high'
-        } else if (managerRating < 3.0 || tenureMonths < 12) {
-            riskLevel = 'medium'
-        }
-
-        rec.tenure_months = tenureMonths
-        rec.turnover_risk  = riskLevel
+    if (hireDateStr) {
+        def hire     = LocalDate.parse(hireDateStr)
+        tenureMonths = (int) ChronoUnit.MONTHS.between(hire, LocalDate.now())
     }
 
-    flowFile = session.write(flowFile, { out ->
-        out.write(JsonOutput.toJson(records).getBytes(StandardCharsets.UTF_8))
-    } as OutputStreamCallback)
+    def risk = 'low'
+    if (empStatus.equalsIgnoreCase('terminated')) {
+        risk = 'high'
+    } else if (managerRating < 3.0 || tenureMonths < 12) {
+        risk = 'medium'
+    }
+
+    record.tenure_months  = tenureMonths == 9999 ? null : tenureMonths
+    record.turnover_risk  = risk
+
+    def out = JsonOutput.toJson(record)
+    flowFile = session.write(flowFile, { os -> os.write(out.bytes) } as OutputStreamCallback)
     session.transfer(flowFile, REL_SUCCESS)
 } catch (Exception e) {
-    log.error('Turnover risk calculation failed: ' + e.message, e)
+    logger.error('Turnover risk script error: ' + e.message, e)
+    flowFile = session.penalize(flowFile)
     session.transfer(flowFile, REL_FAILURE)
 }
 """
 
 
-def create_hr_process_group(parent_pg_id: str, nifi_url: str = "http://localhost:8080") -> None:
+def _proc_config(proc_type: str, name: str, properties: dict[str, str]) -> dict[str, Any]:
+    return {"type": proc_type, "name": name, "properties": properties}
+
+
+def build_hr_process_group(parent_pg_id: str) -> dict[str, Any]:
     """
-    Build the full HR NiFi Process Group.
-
-    Covers Informatica mappings:
-      m_hr_employee_load, m_hr_payroll, m_hr_attendance,
-      m_hr_perf_score, m_hr_turnover
+    Build the HR domain Process Group covering all 5 mappings.
+    Returns a summary dict of processors and connections.
     """
-    logger.info("Connecting to NiFi at %s", nifi_url)
-    nipyapi.config.nifi_config.host = nifi_url + "/nifi-api"
+    config.nifi_config.host = NIFI_HOST
+    logger.info("Building HR Process Group under parent=%s", parent_pg_id)
 
-    try:
-        root = canvas.get_root_pg_id()
-        parent_id = parent_pg_id or root
+    summary: dict[str, Any] = {"processors": {}, "connections": []}
 
-        logger.info("Creating HR Process Group under parent %s", parent_id)
-        hr_pg = canvas.create_process_group(
-            canvas.get_process_group(parent_id),
-            "HR",
-            (600, 700),
-        )
-        pg_id = hr_pg.id
-        logger.info("HR PG created: %s", pg_id)
+    # ------------------------------------------------------------------ #
+    # 1. m_employee_load — GetFile SRC_EMPLOYEES → TGT_EMPLOYEES         #
+    # ------------------------------------------------------------------ #
+    logger.info("[hr] Building m_employee_load sub-flow")
 
-        _build_employee_load(pg_id)
-        _build_payroll(pg_id)
-        _build_attendance(pg_id)
-        _build_perf_score(pg_id)
-        _build_turnover_risk(pg_id)
-
-        logger.info("HR Process Group fully built: %s", pg_id)
-
-    except Exception as exc:
-        logger.error("Failed to build HR Process Group: %s", exc, exc_info=True)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Sub-flow builders
-# ---------------------------------------------------------------------------
-
-def _build_employee_load(pg_id: str) -> None:
-    """
-    m_hr_employee_load:
-    GetFile(SRC_EMPLOYEES) -> CSVReader -> PutFile TGT_EMPLOYEES
-    """
-    logger.info("[m_hr_employee_load] Building sub-flow in PG %s", pg_id)
-
-    try:
-        get = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.GetFile"),
-            (100, 200),
-            "GetFile_SRC_EMPLOYEES",
-            {
-                "Input Directory": "/data/inbound/employees",
-                "File Filter": "*.csv",
-            },
-        )
-
-        put = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.PutFile"),
-            (400, 200),
-            "PutFile_TGT_EMPLOYEES",
-            {"Directory": "/data/outbound/TGT_EMPLOYEES"},
-        )
-
-        canvas.create_connection(get, put, ["success"])
-
-        logger.info("[m_hr_employee_load] sub-flow complete")
-
-    except Exception as exc:
-        logger.warning("[m_hr_employee_load] Could not build via API (offline mode): %s", exc)
-
-
-def _build_payroll(pg_id: str) -> None:
-    """
-    m_hr_payroll:
-    GetFile(SRC_PAYROLL)
-    -> UpdateRecord:
-         total_deductions   = federal_tax + state_tax + insurance + retirement_401k
-         effective_tax_rate = (federal_tax + state_tax) / gross_pay
-         calc_net_pay       = gross_pay - total_deductions
-         net_pay_match      = 'Y' if ABS(calc_net_pay - net_pay) < 0.01 else 'N'
-    -> TGT_PAYROLL
-    """
-    logger.info("[m_hr_payroll] Building sub-flow in PG %s", pg_id)
-
-    try:
-        get = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.GetFile"),
-            (100, 380),
-            "GetFile_SRC_PAYROLL",
-            {
-                "Input Directory": "/data/inbound/payroll",
-                "File Filter": "*.csv",
-            },
-        )
-
-        update = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.UpdateRecord"),
-            (400, 380),
-            "UpdateRecord_Payroll",
-            {
-                "Record Reader": "CSVReader",
-                "Record Writer": "CSVRecordSetWriter",
-                "/total_deductions": (
-                    "${federal_tax:toNumber()"
-                    ":plus(${state_tax:toNumber()})"
-                    ":plus(${insurance:toNumber()})"
-                    ":plus(${retirement_401k:toNumber()})}"
-                ),
-                "/effective_tax_rate": (
-                    "${federal_tax:toNumber():plus(${state_tax:toNumber()})"
-                    ":divide(${gross_pay:toNumber()})}"
-                ),
-                "/calc_net_pay": "${gross_pay:toNumber():minus(${total_deductions:toNumber()})}",
-                "/net_pay_match": (
-                    "${calc_net_pay:toNumber():minus(${net_pay:toNumber()}):abs():lt(0.01):ifElse('Y','N')}"
-                ),
-            },
-        )
-
-        put = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.PutFile"),
-            (700, 380),
-            "PutFile_TGT_PAYROLL",
-            {"Directory": "/data/outbound/TGT_PAYROLL"},
-        )
-
-        canvas.create_connection(get, update, ["success"])
-        canvas.create_connection(update, put, ["success"])
-
-        logger.info("[m_hr_payroll] sub-flow complete")
-
-    except Exception as exc:
-        logger.warning("[m_hr_payroll] Could not build via API (offline mode): %s", exc)
-
-
-def _build_attendance(pg_id: str) -> None:
-    """
-    m_hr_attendance:
-    GetFile(SRC_ATTENDANCE) -> PutFile TGT_ATTENDANCE
-    """
-    logger.info("[m_hr_attendance] Building sub-flow in PG %s", pg_id)
-
-    try:
-        get = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.GetFile"),
-            (100, 560),
-            "GetFile_SRC_ATTENDANCE",
-            {
-                "Input Directory": "/data/inbound/attendance",
-                "File Filter": "*.csv",
-            },
-        )
-
-        put = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.PutFile"),
-            (400, 560),
-            "PutFile_TGT_ATTENDANCE",
-            {"Directory": "/data/outbound/TGT_ATTENDANCE"},
-        )
-
-        canvas.create_connection(get, put, ["success"])
-
-        logger.info("[m_hr_attendance] sub-flow complete")
-
-    except Exception as exc:
-        logger.warning("[m_hr_attendance] Could not build via API (offline mode): %s", exc)
-
-
-def _build_perf_score(pg_id: str) -> None:
-    """
-    m_hr_perf_score:
-    GetFile(SRC_PERFORMANCE)
-    -> UpdateRecord:
-         weighted_score = goal_score*0.4 + competency_score*0.3 + manager_rating*0.3
-         perf_tier      = exceptional(>=4.5) / strong(>=3.8) / meets(>=3.0) / below_expectations
-    -> TGT_PERF_SCORE
-    """
-    logger.info("[m_hr_perf_score] Building sub-flow in PG %s", pg_id)
-
-    tier_expr = (
-        "${weighted_score:toNumber():ge(4.5):ifElse('exceptional',"
-        "${weighted_score:toNumber():ge(3.8):ifElse('strong',"
-        "${weighted_score:toNumber():ge(3.0):ifElse('meets','below_expectations')})})}"
+    get_employees_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.GetFile",
+        "GetFile_SRC_EMPLOYEES",
+        {
+            "Input Directory": INBOUND_DIR,
+            "File Filter":     "SRC_EMPLOYEES.*\\.csv",
+            "Keep Source File": "false",
+        },
     )
 
+    put_employees_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.PutFile",
+        "PutFile_TGT_EMPLOYEES",
+        {"Directory": f"{OUTBOUND_DIR}/TGT_EMPLOYEES"},
+    )
+
+    summary["processors"]["GetFile_SRC_EMPLOYEES"] = get_employees_cfg
+    summary["processors"]["PutFile_TGT_EMPLOYEES"] = put_employees_cfg
+
+    summary["connections"].append(
+        ("GetFile_SRC_EMPLOYEES", "PutFile_TGT_EMPLOYEES", "success")
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2. m_payroll — GetFile SRC_PAYROLL                                 #
+    #    → UpdateRecord (SUM deductions, effective_tax_rate, net_pay)   #
+    # ------------------------------------------------------------------ #
+    logger.info("[hr] Building m_payroll sub-flow")
+
+    get_payroll_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.GetFile",
+        "GetFile_SRC_PAYROLL",
+        {
+            "Input Directory": INBOUND_DIR,
+            "File Filter":     "SRC_PAYROLL.*\\.csv",
+            "Keep Source File": "false",
+        },
+    )
+
+    update_payroll_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.UpdateRecord",
+        "UpdateRecord_Payroll",
+        {
+            "Record Reader": "CSVReader_Payroll",
+            "Record Writer": "CSVWriter_HR",
+            # total_deductions = federal + state + insurance + 401k
+            "/total_deductions":
+                "${federal_tax:plus(${state_tax})"
+                ":plus(${insurance}):plus(${retirement_401k})}",
+            # effective_tax_rate = (federal + state) / gross_pay * 100
+            "/effective_tax_rate":
+                "${federal_tax:plus(${state_tax})"
+                ":divide(${gross_pay}):multiply(100)}",
+            # calc_net_pay = gross - total_deductions
+            "/calc_net_pay":
+                "${gross_pay:minus(${federal_tax:plus(${state_tax})"
+                ":plus(${insurance}):plus(${retirement_401k})})}",
+            # pay_verified: Y if calc_net_pay matches net_pay (within 0.01)
+            "/pay_verified":
+                "${calc_net_pay:minus(${net_pay}):abs():lt(0.01):ifElse('Y','N')}",
+        },
+    )
+
+    put_payroll_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.PutFile",
+        "PutFile_TGT_PAYROLL",
+        {"Directory": f"{OUTBOUND_DIR}/TGT_PAYROLL"},
+    )
+
+    summary["processors"]["GetFile_SRC_PAYROLL"]    = get_payroll_cfg
+    summary["processors"]["UpdateRecord_Payroll"]   = update_payroll_cfg
+    summary["processors"]["PutFile_TGT_PAYROLL"]    = put_payroll_cfg
+
+    summary["connections"] += [
+        ("GetFile_SRC_PAYROLL",      "UpdateRecord_Payroll",    "success"),
+        ("UpdateRecord_Payroll",     "PutFile_TGT_PAYROLL",     "success"),
+    ]
+
+    # ------------------------------------------------------------------ #
+    # 3. m_attendance_load — GetFile SRC_ATTENDANCE → TGT_ATTENDANCE     #
+    # ------------------------------------------------------------------ #
+    logger.info("[hr] Building m_attendance_load sub-flow")
+
+    get_attendance_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.GetFile",
+        "GetFile_SRC_ATTENDANCE",
+        {
+            "Input Directory": INBOUND_DIR,
+            "File Filter":     "SRC_ATTENDANCE.*\\.csv",
+            "Keep Source File": "false",
+        },
+    )
+
+    put_attendance_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.PutFile",
+        "PutFile_TGT_ATTENDANCE",
+        {"Directory": f"{OUTBOUND_DIR}/TGT_ATTENDANCE"},
+    )
+
+    summary["processors"]["GetFile_SRC_ATTENDANCE"] = get_attendance_cfg
+    summary["processors"]["PutFile_TGT_ATTENDANCE"] = put_attendance_cfg
+
+    summary["connections"].append(
+        ("GetFile_SRC_ATTENDANCE", "PutFile_TGT_ATTENDANCE", "success")
+    )
+
+    # ------------------------------------------------------------------ #
+    # 4. m_performance_score — GetFile SRC_PERFORMANCE                   #
+    #    → UpdateRecord weighted_score + performance tier                #
+    #    weighted_score = goal*0.4 + competency*0.3 + manager*0.3       #
+    # ------------------------------------------------------------------ #
+    logger.info("[hr] Building m_performance_score sub-flow")
+
+    get_perf_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.GetFile",
+        "GetFile_SRC_PERFORMANCE",
+        {
+            "Input Directory": INBOUND_DIR,
+            "File Filter":     "SRC_PERFORMANCE.*\\.csv",
+            "Keep Source File": "false",
+        },
+    )
+
+    update_perf_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.UpdateRecord",
+        "UpdateRecord_PerformanceScore",
+        {
+            "Record Reader": "CSVReader_Performance",
+            "Record Writer": "CSVWriter_HR",
+            # weighted_score = goal*0.4 + competency*0.3 + manager*0.3
+            "/weighted_score":
+                "${goal_score:multiply(0.4)"
+                ":plus(${competency_score:multiply(0.3)})"
+                ":plus(${manager_rating:multiply(0.3)})}",
+            # performance_tier
+            "/performance_tier":
+                "${weighted_score:ge(4.5):ifElse('exceptional',"
+                "${weighted_score:ge(3.8):ifElse('strong',"
+                "${weighted_score:ge(3.0):ifElse('meets_expectations',"
+                "'below_expectations')})})}",
+        },
+    )
+
+    put_perf_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.PutFile",
+        "PutFile_TGT_PERF_SCORE",
+        {"Directory": f"{OUTBOUND_DIR}/TGT_PERF_SCORE"},
+    )
+
+    summary["processors"]["GetFile_SRC_PERFORMANCE"]      = get_perf_cfg
+    summary["processors"]["UpdateRecord_PerformanceScore"] = update_perf_cfg
+    summary["processors"]["PutFile_TGT_PERF_SCORE"]        = put_perf_cfg
+
+    summary["connections"] += [
+        ("GetFile_SRC_PERFORMANCE",       "UpdateRecord_PerformanceScore",  "success"),
+        ("UpdateRecord_PerformanceScore", "PutFile_TGT_PERF_SCORE",          "success"),
+    ]
+
+    # ------------------------------------------------------------------ #
+    # 5. m_turnover_risk                                                  #
+    #    LookupRecord (join performance scores)                          #
+    #    → ExecuteScript DATE_DIFF tenure + turnover_risk flag           #
+    # ------------------------------------------------------------------ #
+    logger.info("[hr] Building m_turnover_risk sub-flow")
+
+    lookup_perf_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.LookupRecord",
+        "LookupRecord_PerfForTurnover",
+        {
+            "Record Reader":    "CSVReader_Employees",
+            "Record Writer":    "CSVWriter_HR",
+            "Lookup Service":   "JDBCLookupService_Performance",
+            "key":              "${employee_id}",
+            "result.rating":    "/manager_rating",
+            "Routing Strategy": "Route to success",
+        },
+    )
+
+    turnover_script_cfg = _proc_config(
+        "org.apache.nifi.processors.script.ExecuteScript",
+        "ExecuteScript_TurnoverRisk",
+        {
+            "Script Engine": "Groovy",
+            "Script Body":   TURNOVER_RISK_SCRIPT,
+        },
+    )
+
+    put_turnover_cfg = _proc_config(
+        "org.apache.nifi.processors.standard.PutFile",
+        "PutFile_TGT_TURNOVER",
+        {"Directory": f"{OUTBOUND_DIR}/TGT_TURNOVER"},
+    )
+
+    summary["processors"]["LookupRecord_PerfForTurnover"] = lookup_perf_cfg
+    summary["processors"]["ExecuteScript_TurnoverRisk"]   = turnover_script_cfg
+    summary["processors"]["PutFile_TGT_TURNOVER"]         = put_turnover_cfg
+
+    summary["connections"] += [
+        ("GetFile_SRC_EMPLOYEES",          "LookupRecord_PerfForTurnover", "success"),
+        ("LookupRecord_PerfForTurnover",   "ExecuteScript_TurnoverRisk",   "matched"),
+        ("ExecuteScript_TurnoverRisk",     "PutFile_TGT_TURNOVER",          "success"),
+    ]
+
+    logger.info("[hr] Process Group definition built with %d processors.",
+                len(summary["processors"]))
+    return summary
+
+
+def run() -> None:
+    """Entry point called by main.py."""
+    logger.info("=== HR domain: starting ===")
     try:
-        get = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.GetFile"),
-            (100, 740),
-            "GetFile_SRC_PERFORMANCE",
-            {
-                "Input Directory": "/data/inbound/performance",
-                "File Filter": "*.csv",
-            },
-        )
-
-        update = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.UpdateRecord"),
-            (400, 740),
-            "UpdateRecord_PerfScore",
-            {
-                "Record Reader": "CSVReader",
-                "Record Writer": "CSVRecordSetWriter",
-                "/weighted_score": (
-                    "${goal_score:toNumber():multiply(0.4)"
-                    ":plus(${competency_score:toNumber():multiply(0.3)})"
-                    ":plus(${manager_rating:toNumber():multiply(0.3)})}"
-                ),
-                "/perf_tier": tier_expr,
-            },
-        )
-
-        put = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.PutFile"),
-            (700, 740),
-            "PutFile_TGT_PERF_SCORE",
-            {"Directory": "/data/outbound/TGT_PERF_SCORE"},
-        )
-
-        canvas.create_connection(get, update, ["success"])
-        canvas.create_connection(update, put, ["success"])
-
-        logger.info("[m_hr_perf_score] sub-flow complete")
-
+        config.nifi_config.host = NIFI_HOST
+        root_pg = canvas.get_process_group("root")
+        parent_id = root_pg.id if root_pg else "root"
+        summary = build_hr_process_group(parent_id)
+        logger.info("HR Process Group summary:\n%s",
+                    json.dumps({"processor_count": len(summary["processors"]),
+                                "connection_count": len(summary["connections"])}, indent=2))
     except Exception as exc:
-        logger.warning("[m_hr_perf_score] Could not build via API (offline mode): %s", exc)
-
-
-def _build_turnover_risk(pg_id: str) -> None:
-    """
-    m_hr_turnover:
-    LookupRecord (join employee performance on employee_id)
-    -> ExecuteScript (Groovy DATE_DIFF tenure, turnover_risk flag)
-    -> TGT_TURNOVER
-    """
-    logger.info("[m_hr_turnover] Building sub-flow in PG %s", pg_id)
-
-    try:
-        lookup = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.LookupRecord"),
-            (100, 920),
-            "LookupRecord_EmployeePerf",
-            {
-                "Record Reader": "CSVReader",
-                "Record Writer": "CSVRecordSetWriter",
-                "Lookup Service": "DatabaseRecordLookupService",
-                "Result RecordPath": "/manager_rating",
-                "employee_id": "/employee_id",
-            },
-        )
-
-        execute = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.script.ExecuteScript"),
-            (400, 920),
-            "ExecuteScript_TurnoverRisk",
-            {
-                "Script Engine": "Groovy",
-                "Script Body": GROOVY_TURNOVER_RISK,
-            },
-        )
-
-        put = canvas.create_processor(
-            canvas.get_process_group(pg_id),
-            canvas.get_processor_type("org.apache.nifi.processors.standard.PutFile"),
-            (700, 920),
-            "PutFile_TGT_TURNOVER",
-            {"Directory": "/data/outbound/TGT_TURNOVER"},
-        )
-
-        canvas.create_connection(lookup, execute, ["matched", "unmatched"])
-        canvas.create_connection(execute, put, ["success"])
-
-        logger.info("[m_hr_turnover] sub-flow complete")
-
-    except Exception as exc:
-        logger.warning("[m_hr_turnover] Could not build via API (offline mode): %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Module entry-point (called by main.py)
-# ---------------------------------------------------------------------------
-
-def run(nifi_url: str = "http://localhost:8080", parent_pg_id: str = "") -> None:
-    """Entry-point called by main.py to deploy the HR Process Group."""
-    logger.info("=== HR domain deployment starting ===")
-    create_hr_process_group(parent_pg_id=parent_pg_id, nifi_url=nifi_url)
-    logger.info("=== HR domain deployment complete ===")
+        logger.error("HR domain failed: %s", exc, exc_info=True)
+        raise
+    logger.info("=== HR domain: complete ===")
 
 
 if __name__ == "__main__":
