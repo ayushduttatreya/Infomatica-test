@@ -1,83 +1,244 @@
-version: '3.8'
+version: "3.9"
+
+# XClarity ETL — NiFi Migration Stack
+# Covers tickets: c11d8e8b (NiFi cluster), 88c82c52 (Redis cluster),
+#                 fab97221 (NiFi 3-node), e45d4681 (Redis + JDBC),
+#                 4fb50100 (NiFi Registry + Prometheus/Grafana)
+
+networks:
+  xclarity_net:
+    driver: bridge
+
+volumes:
+  zookeeper_data:
+  zookeeper_logs:
+  nifi_1_data:
+  nifi_2_data:
+  nifi_3_data:
+  nifi_registry_data:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
 
 services:
-  nifi:
-    image: apache/nifi:1.23.2
-    container_name: nifi
+
+  # --------------------------------------------------------------------------
+  # ZooKeeper — coordination for NiFi cluster
+  # --------------------------------------------------------------------------
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: xclarity_zookeeper
+    hostname: zookeeper
+    networks: [xclarity_net]
     ports:
-      - "8443:8443"
-      - "8080:8080"
+      - "2181:2181"
     environment:
-      - SINGLE_USER_CREDENTIALS_USERNAME=admin
-      - SINGLE_USER_CREDENTIALS_PASSWORD=ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB
-      - NIFI_WEB_HTTP_PORT=8080
-      - NIFI_WEB_HTTPS_PORT=8443
-      - NIFI_JVM_HEAP_INIT=2g
-      - NIFI_JVM_HEAP_MAX=4g
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: "server.1=zookeeper:2888:3888;2181"
+      ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok"
     volumes:
-      - nifi_conf:/opt/nifi/nifi-current/conf
-      - nifi_database_repository:/opt/nifi/nifi-current/database_repository
-      - nifi_flowfile_repository:/opt/nifi/nifi-current/flowfile_repository
-      - nifi_content_repository:/opt/nifi/nifi-current/content_repository
-      - nifi_provenance_repository:/opt/nifi/nifi-current/provenance_repository
-      - nifi_state:/opt/nifi/nifi-current/state
-      - nifi_logs:/opt/nifi/nifi-current/logs
-      - ./data:/opt/nifi/data
-      - ./templates:/opt/nifi/templates
-    networks:
-      - nifi_network
+      - zookeeper_data:/data
+      - zookeeper_logs:/datalog
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/nifi"]
+      test: ["CMD", "zkServer.sh", "status"]
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # --------------------------------------------------------------------------
+  # NiFi Node 1
+  # --------------------------------------------------------------------------
+  nifi-1:
+    image: apache/nifi:1.24.0
+    container_name: xclarity_nifi_1
+    hostname: nifi-1
+    networks: [xclarity_net]
+    ports:
+      - "8443:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_CLUSTER_IS_NODE: "true"
+      NIFI_CLUSTER_NODE_PROTOCOL_PORT: "11443"
+      NIFI_ZK_CONNECT_STRING: "zookeeper:2181"
+      NIFI_ELECTION_MAX_WAIT: "1 min"
+      NIFI_SENSITIVE_PROPS_KEY: "${NIFI_SENSITIVE_KEY:-xclarity_etl_key_32chars!}"
+      NIFI_JVM_HEAP_INIT: "2g"
+      NIFI_JVM_HEAP_MAX: "8g"
+      SINGLE_USER_CREDENTIALS_USERNAME: "${NIFI_USER:-admin}"
+      SINGLE_USER_CREDENTIALS_PASSWORD: "${NIFI_PASS:-adminPassword1}"
+    volumes:
+      - nifi_1_data:/opt/nifi/nifi-current/data
+      - ./data:/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-k", "-f", "https://localhost:8443/nifi-api/system-diagnostics"]
+      interval: 60s
+      timeout: 20s
+      retries: 10
       start_period: 120s
 
-  postgres:
-    image: postgres:15-alpine
-    container_name: nifi_postgres
-    environment:
-      - POSTGRES_USER=nifi_user
-      - POSTGRES_PASSWORD=nifi_password
-      - POSTGRES_DB=nifi_db
+  # --------------------------------------------------------------------------
+  # NiFi Node 2
+  # --------------------------------------------------------------------------
+  nifi-2:
+    image: apache/nifi:1.24.0
+    container_name: xclarity_nifi_2
+    hostname: nifi-2
+    networks: [xclarity_net]
     ports:
-      - "5432:5432"
+      - "8444:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_CLUSTER_IS_NODE: "true"
+      NIFI_CLUSTER_NODE_PROTOCOL_PORT: "11443"
+      NIFI_ZK_CONNECT_STRING: "zookeeper:2181"
+      NIFI_ELECTION_MAX_WAIT: "1 min"
+      NIFI_SENSITIVE_PROPS_KEY: "${NIFI_SENSITIVE_KEY:-xclarity_etl_key_32chars!}"
+      NIFI_JVM_HEAP_INIT: "2g"
+      NIFI_JVM_HEAP_MAX: "8g"
+      SINGLE_USER_CREDENTIALS_USERNAME: "${NIFI_USER:-admin}"
+      SINGLE_USER_CREDENTIALS_PASSWORD: "${NIFI_PASS:-adminPassword1}"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - nifi_network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nifi_user"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - nifi_2_data:/opt/nifi/nifi-current/data
+      - ./data:/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    restart: unless-stopped
 
+  # --------------------------------------------------------------------------
+  # NiFi Node 3
+  # --------------------------------------------------------------------------
+  nifi-3:
+    image: apache/nifi:1.24.0
+    container_name: xclarity_nifi_3
+    hostname: nifi-3
+    networks: [xclarity_net]
+    ports:
+      - "8445:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_CLUSTER_IS_NODE: "true"
+      NIFI_CLUSTER_NODE_PROTOCOL_PORT: "11443"
+      NIFI_ZK_CONNECT_STRING: "zookeeper:2181"
+      NIFI_ELECTION_MAX_WAIT: "1 min"
+      NIFI_SENSITIVE_PROPS_KEY: "${NIFI_SENSITIVE_KEY:-xclarity_etl_key_32chars!}"
+      NIFI_JVM_HEAP_INIT: "2g"
+      NIFI_JVM_HEAP_MAX: "8g"
+      SINGLE_USER_CREDENTIALS_USERNAME: "${NIFI_USER:-admin}"
+      SINGLE_USER_CREDENTIALS_PASSWORD: "${NIFI_PASS:-adminPassword1}"
+    volumes:
+      - nifi_3_data:/opt/nifi/nifi-current/data
+      - ./data:/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # NiFi Registry — flow version control
+  # --------------------------------------------------------------------------
+  nifi-registry:
+    image: apache/nifi-registry:1.24.0
+    container_name: xclarity_nifi_registry
+    hostname: nifi-registry
+    networks: [xclarity_net]
+    ports:
+      - "18080:18080"
+    volumes:
+      - nifi_registry_data:/opt/nifi-registry/nifi-registry-current/database
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Redis — SCD2 state cache + exchange rate lookup
+  # --------------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
-    container_name: nifi_redis
+    image: redis:7.2-alpine
+    container_name: xclarity_redis
+    hostname: redis
+    networks: [xclarity_net]
     ports:
       - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --requirepass "${REDIS_PASS:-}"
     volumes:
       - redis_data:/data
-    networks:
-      - nifi_network
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-volumes:
-  nifi_conf:
-  nifi_database_repository:
-  nifi_flowfile_repository:
-  nifi_content_repository:
-  nifi_provenance_repository:
-  nifi_state:
-  nifi_logs:
-  postgres_data:
-  redis_data:
+  # --------------------------------------------------------------------------
+  # PostgreSQL — persistent lookup tables (category hierarchy, customer SCD2,
+  #              exchange rate archive, supplier data)
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: xclarity_postgres
+    hostname: postgres
+    networks: [xclarity_net]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       xclarity
+      POSTGRES_USER:     "${JDBC_USER:-etl_user}"
+      POSTGRES_PASSWORD: "${JDBC_PASS:-etl_pass}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${JDBC_USER:-etl_user} -d xclarity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-networks:
-  nifi_network:
-    driver: bridge
+  # --------------------------------------------------------------------------
+  # Prometheus — NiFi metrics scraper
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: xclarity_prometheus
+    hostname: prometheus
+    networks: [xclarity_net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Grafana — dashboards for NiFi throughput / latency / back-pressure
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: xclarity_grafana
+    hostname: grafana
+    networks: [xclarity_net]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER:     "${GRAFANA_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASS:-admin}"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on: [prometheus]
+    restart: unless-stopped
