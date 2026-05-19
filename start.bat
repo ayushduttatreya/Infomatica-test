@@ -1,158 +1,87 @@
 @echo off
-REM start.bat - Windows startup script for info-to-nifi project
+REM start.bat — XClarity ETL: start Docker stack, then run migration pipeline
+REM Usage: start.bat [--no-docker]
 
-echo ==========================================
-echo info-to-nifi Pipeline Startup Script
-echo ==========================================
-echo.
+setlocal enabledelayedexpansion
 
-REM Check if Docker is installed
-docker --version >nul 2>&1
-if errorlevel 1 (
-    echo Error: Docker is not installed
-    echo Please install Docker Desktop from https://docs.docker.com/desktop/install/windows-install/
-    pause
-    exit /b 1
-)
+SET SCRIPT_DIR=%~dp0
+SET LOG_FILE=%SCRIPT_DIR%migration_%DATE:~-4,4%%DATE:~-10,2%%DATE:~-7,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%.log
+SET LOG_FILE=%LOG_FILE: =0%
 
-REM Check if Docker Compose is installed
-docker-compose --version >nul 2>&1
-if errorlevel 1 (
-    docker compose version >nul 2>&1
-    if errorlevel 1 (
-        echo Error: Docker Compose is not installed
-        echo Please install Docker Compose from https://docs.docker.com/compose/install/
-        pause
-        exit /b 1
+PUSHD "%SCRIPT_DIR%"
+
+echo ============================================== >> "%LOG_FILE%"
+echo  XClarity ETL Migration -- %DATE% %TIME% >> "%LOG_FILE%"
+echo ============================================== >> "%LOG_FILE%"
+echo  XClarity ETL Migration -- %DATE% %TIME%
+
+REM ---- Load .env if present -----------------------------------------------
+IF EXIST "%SCRIPT_DIR%.env" (
+    echo [INFO] Loading .env
+    FOR /F "usebackq tokens=1,* delims==" %%A IN ("%SCRIPT_DIR%.env") DO (
+        SET "%%A=%%B"
     )
 )
 
-REM Check if Python 3 is installed
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo Error: Python 3 is not installed
-    echo Please install Python 3 from https://www.python.org/downloads/
-    pause
-    exit /b 1
+IF NOT DEFINED NIFI_HOST SET NIFI_HOST=https://localhost:8443
+
+SET SKIP_DOCKER=%1
+
+REM ---- Start Docker stack --------------------------------------------------
+IF NOT "%SKIP_DOCKER%"=="--no-docker" (
+    echo [INFO] Starting Docker Compose stack...
+
+    WHERE docker >nul 2>&1
+    IF ERRORLEVEL 1 (
+        echo [ERROR] docker not found on PATH. Install Docker Desktop.
+        EXIT /B 1
+    )
+
+    docker compose up -d --remove-orphans
+    IF ERRORLEVEL 1 (
+        echo [ERROR] docker compose up failed.
+        EXIT /B 1
+    )
+
+    echo [INFO] Waiting for NiFi to become healthy (up to 3 minutes)...
+    SET RETRIES=36
+    :NIFI_WAIT
+    curl -sk "%NIFI_HOST%/nifi-api/system-diagnostics" >nul 2>&1
+    IF ERRORLEVEL 1 (
+        SET /A RETRIES=!RETRIES!-1
+        IF !RETRIES! LEQ 0 (
+            echo [ERROR] NiFi did not become healthy. Check: docker compose logs nifi-1
+            EXIT /B 1
+        )
+        echo [INFO] NiFi not ready yet, retrying in 5s... (!RETRIES! attempts left)
+        TIMEOUT /T 5 /NOBREAK >nul
+        GOTO NIFI_WAIT
+    )
+    echo [INFO] NiFi is healthy.
+) ELSE (
+    echo [INFO] --no-docker flag set: skipping Docker Compose start.
 )
 
-echo All prerequisites are installed
-echo.
-
-REM Create necessary directories
-echo Creating necessary directories...
-if not exist "data" mkdir data
-if not exist "templates" mkdir templates
-if not exist "logs" mkdir logs
-
-REM Start Docker Compose services
-echo.
-echo Starting Docker Compose services...
-echo This may take a few minutes on first run...
-echo.
-
-docker compose version >nul 2>&1
-if errorlevel 1 (
-    docker-compose up -d
-) else (
-    docker compose up -d
+REM ---- Install Python dependencies -----------------------------------------
+echo [INFO] Installing Python dependencies...
+pip install --quiet -r "%SCRIPT_DIR%requirements.txt"
+IF ERRORLEVEL 1 (
+    echo [ERROR] pip install failed.
+    EXIT /B 1
 )
 
-if errorlevel 1 (
-    echo Error: Failed to start Docker services
-    pause
-    exit /b 1
+REM ---- Run migration pipeline ----------------------------------------------
+echo [INFO] Running migration pipeline...
+python "%SCRIPT_DIR%main.py"
+IF ERRORLEVEL 1 (
+    echo [ERROR] Migration pipeline failed. See log: %LOG_FILE%
+    EXIT /B 1
 )
 
-REM Wait for services to be ready
-echo.
-echo Waiting for services to be ready...
-echo NiFi UI will be available at: http://localhost:8080/nifi
-echo Username: admin
-echo Password: ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB
-echo.
+echo ==============================================
+echo  Migration complete -- %DATE% %TIME%
+echo  Log: %LOG_FILE%
+echo ==============================================
 
-REM Wait for NiFi to be ready
-set MAX_WAIT=180
-set WAIT_TIME=0
-
-:wait_loop
-if %WAIT_TIME% GEQ %MAX_WAIT% goto wait_timeout
-
-curl -s -f http://localhost:8080/nifi >nul 2>&1
-if not errorlevel 1 (
-    echo NiFi is ready!
-    goto nifi_ready
-)
-
-echo Waiting for NiFi to start... (%WAIT_TIME%/%MAX_WAIT% seconds^)
-timeout /t 10 /nobreak >nul
-set /a WAIT_TIME=%WAIT_TIME%+10
-goto wait_loop
-
-:wait_timeout
-echo Warning: NiFi did not start within expected time
-echo You can check the status with: docker logs nifi
-goto continue_setup
-
-:nifi_ready
-echo.
-
-:continue_setup
-REM Check if virtual environment exists
-if not exist "venv" (
-    echo.
-    echo Creating Python virtual environment...
-    python -m venv venv
-)
-
-REM Activate virtual environment
-echo.
-echo Activating virtual environment...
-call venv\Scripts\activate.bat
-
-REM Install/upgrade pip
-echo.
-echo Upgrading pip...
-python -m pip install --upgrade pip
-
-REM Install requirements
-echo.
-echo Installing Python dependencies...
-pip install -r requirements.txt
-
-if errorlevel 1 (
-    echo Error: Failed to install Python dependencies
-    pause
-    exit /b 1
-)
-
-REM Run the pipeline
-echo.
-echo ==========================================
-echo Starting Pipeline Execution
-echo ==========================================
-echo.
-
-python main.py
-
-REM Capture exit code
-set EXIT_CODE=%ERRORLEVEL%
-
-echo.
-echo ==========================================
-if %EXIT_CODE% EQU 0 (
-    echo Pipeline completed successfully
-) else (
-    echo Pipeline completed with errors ^(exit code: %EXIT_CODE%^)
-)
-echo ==========================================
-echo.
-echo Docker services are still running.
-echo To stop services, run: docker-compose down
-echo To view NiFi UI, visit: http://localhost:8080/nifi
-echo To view logs, run: docker logs nifi
-echo.
-
-pause
-exit /b %EXIT_CODE%
+POPD
+endlocal
