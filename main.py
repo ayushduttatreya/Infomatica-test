@@ -1,108 +1,94 @@
 """
-main.py – XClarity ETL NiFi Migration Runner
-Discovers and runs all src/*.py modules in dependency order.
+main.py
+XClarity ETL — Informatica → Apache NiFi migration runner.
 
-Deployment order (per spec.md Phase plan):
-  Phase 0 (Infrastructure):
-    1. controller_services  – shared CS: CSV readers/writers, JDBC, Redis, schema registry
-    2. schemas              – register all 27+ Avro source/target schemas
+Discovers and executes all src/*.py modules in dependency order:
+  1. schemas    — write Avro schema files
+  2. extract    — NiFi infrastructure setup (controller services, PGs, param contexts)
+  3. finance    — PG_Finance (no upstream domain dependencies)
+  4. product    — PG_Product
+  5. customer   — PG_Customer
+  6. sales      — PG_Sales
+  7. hr_operations — PG_HR_Operations
 
-  Phase 1 (Foundation):
-    3. hr         – HR module (simple, standalone)
-    4. operations – Operations module (simple, depends on Sales + Product in data, but deployable early)
-
-  Phase 2 (Core Business Logic):
-    5. finance    – Finance module (standalone, complex)
-    6. sales      – Sales module (depends on Customer)
-
-  Phase 3 (Complex Transforms):
-    7. customer   – Customer module (SCD2, PII masking, churn)
-    8. product    – Product module (hierarchy, lifecycle, recommendations)
-
-Usage:
-  python main.py [--nifi-url http://localhost:8080] [--modules all|hr,sales,...]
+Each module exposes a `run()` function that is invoked here.
+Errors in individual modules are logged and do not stop subsequent modules.
 """
 
-import argparse
 import importlib
 import logging
-import os
 import sys
 import time
-from typing import List
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Logging setup (before any module imports that configure their own loggers)
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("migration_run.log", encoding="utf-8"),
+        logging.FileHandler("xclarity_etl.log", mode="a"),
     ],
 )
+logger = logging.getLogger("xclarity_etl.main")
 
 # ---------------------------------------------------------------------------
-# Module deployment order (dependency-aware)
+# Module execution order
+# Dependency order matches spec.md §7.4 (Finance first, HR_Ops last)
 # ---------------------------------------------------------------------------
-
-DEPLOYMENT_ORDER: List[str] = [
-    "controller_services",  # shared NiFi controller services first
-    "schemas",              # Avro schema registration
-    "hr",                   # Phase 1: simple standalone
-    "operations",           # Phase 1: simple, reads Sales/Product data only
-    "finance",              # Phase 2: complex, standalone
-    "sales",                # Phase 2: depends on Customer data
-    "customer",             # Phase 3: complex SCD2, PII
-    "product",              # Phase 3: complex hierarchy, lifecycle
+MODULE_ORDER = [
+    "src.schemas",
+    "src.extract",
+    "src.finance",
+    "src.product",
+    "src.customer",
+    "src.sales",
+    "src.hr_operations",
 ]
 
-SRC_DIR = os.path.join(os.path.dirname(__file__), "src")
 
-
-def discover_modules() -> List[str]:
-    """Return all module names found in src/ that match the deployment order list."""
-    available = []
-    for name in DEPLOYMENT_ORDER:
-        module_path = os.path.join(SRC_DIR, f"{name}.py")
-        if os.path.isfile(module_path):
-            available.append(name)
-        else:
-            logger.warning("Module file not found, skipping: src/%s.py", name)
-    return available
-
-
-def run_module(module_name: str, nifi_url: str) -> bool:
+def discover_modules() -> list[str]:
     """
-    Import and execute the run() function from src/<module_name>.py.
+    Discover all src/*.py module names.
+    Returns them sorted in the required execution order;
+    any extra modules found (not in MODULE_ORDER) are appended at the end.
+    """
+    src_dir = Path(__file__).parent / "src"
+    found = {
+        f"src.{p.stem}"
+        for p in src_dir.glob("*.py")
+        if p.stem != "__init__"
+    }
+    # Modules in MODULE_ORDER first (preserving order), then anything extra
+    ordered = [m for m in MODULE_ORDER if m in found]
+    extras = sorted(found - set(MODULE_ORDER))
+    return ordered + extras
 
+
+def run_module(module_name: str) -> bool:
+    """
+    Import and call `run()` on a single module.
     Returns True on success, False on error.
     """
-    logger.info("=" * 60)
-    logger.info("Running module: %s", module_name)
-    logger.info("=" * 60)
-
-    start = time.time()
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info("Starting module: %s", module_name)
+    start = time.monotonic()
     try:
-        # Add src/ to the Python path for imports
-        if SRC_DIR not in sys.path:
-            sys.path.insert(0, SRC_DIR)
-
         mod = importlib.import_module(module_name)
-        run_fn = getattr(mod, "run", None)
-
-        if run_fn is None:
-            logger.error("Module %s has no run() function – skipping", module_name)
-            return False
-
-        run_fn(nifi_url=nifi_url)
-        elapsed = time.time() - start
-        logger.info("Module %s completed successfully in %.1fs", module_name, elapsed)
+        if not hasattr(mod, "run"):
+            logger.warning("Module '%s' has no run() function — skipped.", module_name)
+            return True
+        mod.run()
+        elapsed = time.monotonic() - start
+        logger.info("Module '%s' completed in %.1fs.", module_name, elapsed)
         return True
-
     except Exception as exc:
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
         logger.error(
-            "Module %s FAILED after %.1fs: %s",
+            "Module '%s' FAILED after %.1fs: %s",
             module_name, elapsed, exc,
             exc_info=True,
         )
@@ -110,82 +96,37 @@ def run_module(module_name: str, nifi_url: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="XClarity ETL – NiFi migration runner. Deploys all domain Process Groups."
-    )
-    parser.add_argument(
-        "--nifi-url",
-        default=os.environ.get("NIFI_URL", "http://localhost:8080"),
-        help="NiFi base URL (default: http://localhost:8080 or $NIFI_URL)",
-    )
-    parser.add_argument(
-        "--modules",
-        default="all",
-        help=(
-            "Comma-separated list of modules to run, or 'all' for full deployment. "
-            f"Available: {', '.join(DEPLOYMENT_ORDER)}"
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List modules that would be deployed without executing them",
-    )
-    args = parser.parse_args()
+    """
+    Main entry point.
+    Runs all modules in order; returns 0 if all succeed, 1 if any fail.
+    """
+    logger.info("╔══════════════════════════════════════════════╗")
+    logger.info("║  XClarity ETL — Informatica → NiFi Migration ║")
+    logger.info("╚══════════════════════════════════════════════╝")
 
-    nifi_url: str = args.nifi_url.rstrip("/")
-    dry_run: bool = args.dry_run
+    modules = discover_modules()
+    logger.info("Execution plan (%d modules): %s", len(modules), modules)
 
-    # Determine which modules to run
-    if args.modules.strip().lower() == "all":
-        modules_to_run = discover_modules()
-    else:
-        requested = [m.strip() for m in args.modules.split(",") if m.strip()]
-        # Preserve dependency order for requested subset
-        modules_to_run = [m for m in DEPLOYMENT_ORDER if m in requested]
-        unknown = set(requested) - set(DEPLOYMENT_ORDER)
-        if unknown:
-            logger.warning("Unknown modules (ignored): %s", ", ".join(sorted(unknown)))
+    results: dict[str, bool] = {}
+    overall_start = time.monotonic()
 
-    if not modules_to_run:
-        logger.error("No valid modules selected for deployment.")
-        return 1
-
-    logger.info("NiFi URL     : %s", nifi_url)
-    logger.info("Dry run      : %s", dry_run)
-    logger.info("Modules (%d) : %s", len(modules_to_run), ", ".join(modules_to_run))
-
-    if dry_run:
-        logger.info("Dry run mode – no changes applied.")
-        return 0
-
-    # Run modules in order
-    results = {}
-    for module_name in modules_to_run:
-        success = run_module(module_name, nifi_url=nifi_url)
+    for module_name in modules:
+        success = run_module(module_name)
         results[module_name] = success
 
-    # Summary
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("DEPLOYMENT SUMMARY")
-    logger.info("=" * 60)
-    passed = [m for m, ok in results.items() if ok]
+    total_elapsed = time.monotonic() - overall_start
     failed = [m for m, ok in results.items() if not ok]
+    succeeded = [m for m, ok in results.items() if ok]
 
-    for m in passed:
-        logger.info("  [OK]   %s", m)
-    for m in failed:
-        logger.error("  [FAIL] %s", m)
-
-    logger.info("")
-    logger.info("Passed: %d / %d", len(passed), len(results))
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info("Run complete in %.1fs.", total_elapsed)
+    logger.info("Succeeded (%d): %s", len(succeeded), succeeded)
 
     if failed:
-        logger.error("Failed modules: %s", ", ".join(failed))
+        logger.error("FAILED    (%d): %s", len(failed), failed)
         return 1
 
-    logger.info("All modules deployed successfully.")
+    logger.info("All modules completed successfully.")
     return 0
 
 
