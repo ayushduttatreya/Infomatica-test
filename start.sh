@@ -1,65 +1,109 @@
 #!/usr/bin/env bash
-# start.sh — XClarity ETL: start Docker stack, then run migration pipeline
-# Usage: ./start.sh [--no-docker]  (--no-docker skips docker-compose if already running)
+# start.sh — Start the XClarity ETL Informatica→NiFi migration pipeline (Linux/macOS)
+# Usage: ./start.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
-LOG_FILE="$SCRIPT_DIR/migration_$(date +%Y%m%d_%H%M%S).log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+echo "╔══════════════════════════════════════════════╗"
+echo "║  XClarity ETL — start.sh                     ║"
+echo "╚══════════════════════════════════════════════╝"
 
-echo "=============================================="
-echo " XClarity ETL Migration — $(date)"
-echo "=============================================="
+# ---------------------------------------------------------------------------
+# 1. Pre-flight checks
+# ---------------------------------------------------------------------------
+command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found in PATH."; exit 1; }
+command -v docker-compose >/dev/null 2>&1 || command -v "docker compose" >/dev/null 2>&1 || \
+    { echo "ERROR: docker-compose not found."; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found."; exit 1; }
 
-# ---- Load environment --------------------------------------------------------
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    echo "[INFO] Loading .env"
-    # shellcheck disable=SC2046
-    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+# ---------------------------------------------------------------------------
+# 2. Create required data directories
+# ---------------------------------------------------------------------------
+mkdir -p \
+    "${SCRIPT_DIR}/data/source/customer" \
+    "${SCRIPT_DIR}/data/source/sales" \
+    "${SCRIPT_DIR}/data/source/product" \
+    "${SCRIPT_DIR}/data/source/finance" \
+    "${SCRIPT_DIR}/data/source/hr" \
+    "${SCRIPT_DIR}/data/source/lookup" \
+    "${SCRIPT_DIR}/data/output/customer" \
+    "${SCRIPT_DIR}/data/output/sales" \
+    "${SCRIPT_DIR}/data/output/product" \
+    "${SCRIPT_DIR}/data/output/finance" \
+    "${SCRIPT_DIR}/data/output/hr" \
+    "${SCRIPT_DIR}/schemas" \
+    "${SCRIPT_DIR}/sql"
+
+# ---------------------------------------------------------------------------
+# 3. Start Docker services (NiFi, NiFi Registry, PostgreSQL)
+# ---------------------------------------------------------------------------
+echo ""
+echo "[1/4] Starting Docker services…"
+cd "${SCRIPT_DIR}"
+
+# Use 'docker compose' (v2) or fall back to 'docker-compose' (v1)
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
 fi
 
-NIFI_HOST="${NIFI_HOST:-https://localhost:8443}"
-SKIP_DOCKER="${1:-}"
+${COMPOSE_CMD} up -d nifi nifi-registry postgres
 
-# ---- Start Docker stack -------------------------------------------------------
-if [ "$SKIP_DOCKER" != "--no-docker" ]; then
-    echo "[INFO] Starting Docker Compose stack..."
+# ---------------------------------------------------------------------------
+# 4. Wait for NiFi to become healthy
+# ---------------------------------------------------------------------------
+echo ""
+echo "[2/4] Waiting for NiFi to be healthy (up to 5 minutes)…"
+MAX_WAIT=300
+WAITED=0
+INTERVAL=10
 
-    if ! command -v docker &>/dev/null; then
-        echo "[ERROR] docker not found on PATH. Install Docker Desktop or Docker Engine."
+while true; do
+    STATUS=$(${COMPOSE_CMD} ps --format json nifi 2>/dev/null | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('Health','unknown'))" 2>/dev/null || echo "unknown")
+    if [ "${STATUS}" = "healthy" ]; then
+        echo "NiFi is healthy."
+        break
+    fi
+    if [ "${WAITED}" -ge "${MAX_WAIT}" ]; then
+        echo "ERROR: NiFi did not become healthy within ${MAX_WAIT}s."
+        ${COMPOSE_CMD} logs --tail=50 nifi
         exit 1
     fi
+    echo "  Waiting for NiFi… (${WAITED}s elapsed, status=${STATUS})"
+    sleep "${INTERVAL}"
+    WAITED=$((WAITED + INTERVAL))
+done
 
-    docker compose up -d --remove-orphans
+# ---------------------------------------------------------------------------
+# 5. Install Python dependencies (inside a venv if possible)
+# ---------------------------------------------------------------------------
+echo ""
+echo "[3/4] Installing Python dependencies…"
+if [ ! -d "${SCRIPT_DIR}/.venv" ]; then
+    python3 -m venv "${SCRIPT_DIR}/.venv"
+fi
+source "${SCRIPT_DIR}/.venv/bin/activate"
+pip install --quiet --upgrade pip
+pip install --quiet -r "${SCRIPT_DIR}/requirements.txt"
 
-    echo "[INFO] Waiting for NiFi to become healthy (up to 3 minutes)..."
-    RETRIES=36  # 36 x 5s = 3 min
-    until curl -sk "$NIFI_HOST/nifi-api/system-diagnostics" > /dev/null 2>&1; do
-        RETRIES=$((RETRIES - 1))
-        if [ "$RETRIES" -le 0 ]; then
-            echo "[ERROR] NiFi did not become healthy in time. Check: docker compose logs nifi-1"
-            exit 1
-        fi
-        echo "[INFO] NiFi not ready yet, retrying in 5s... ($RETRIES attempts left)"
-        sleep 5
-    done
-    echo "[INFO] NiFi is healthy."
+# ---------------------------------------------------------------------------
+# 6. Run main.py
+# ---------------------------------------------------------------------------
+echo ""
+echo "[4/4] Running main.py…"
+cd "${SCRIPT_DIR}"
+python3 main.py
+EXIT_CODE=$?
+
+echo ""
+if [ "${EXIT_CODE}" -eq 0 ]; then
+    echo "Migration pipeline completed successfully."
 else
-    echo "[INFO] --no-docker flag set: skipping Docker Compose start."
+    echo "Migration pipeline finished with errors (exit code ${EXIT_CODE}). Check xclarity_etl.log."
 fi
 
-# ---- Install Python dependencies ----------------------------------------------
-echo "[INFO] Installing Python dependencies..."
-pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
-
-# ---- Run migration pipeline --------------------------------------------------
-echo "[INFO] Running migration pipeline..."
-python "$SCRIPT_DIR/main.py"
-
-echo "=============================================="
-echo " Migration complete — $(date)"
-echo " Log: $LOG_FILE"
-echo "=============================================="
+exit "${EXIT_CODE}"
