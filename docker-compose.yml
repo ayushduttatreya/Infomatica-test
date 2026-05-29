@@ -1,26 +1,123 @@
-services:
-  etl-runner:
-    build: .
-    container_name: informatica-etl-runner
-    environment:
-      - BATCH_ID=BATCH_DOCKER_001
-      - LOG_LEVEL=INFO
-      - SOURCE_DIR=/app/source_data
-      - TARGET_DIR=/app/target_data
-      - MAPPING_FILE=/app/mappings/informatica_repository.xml
-    volumes:
-      - ./source_data:/app/source_data:ro
-      - ./target_data:/app/target_data
-      - ./mappings:/app/mappings:ro
+version: "3.8"
 
-  test-validator:
-    build: .
-    container_name: informatica-test-validator
-    depends_on:
-      etl-runner:
-        condition: service_completed_successfully
+services:
+  nifi:
+    image: apache/nifi:1.25.0
+    container_name: xclarity_nifi
+    ports:
+      - "8443:8443"
     environment:
-      - TARGET_DIR=/app/target_data
+      NIFI_WEB_HTTPS_PORT: "8443"
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: adminpassword123
+      NIFI_JVM_HEAP_INIT: 2g
+      NIFI_JVM_HEAP_MAX: 8g
     volumes:
-      - ./target_data:/app/target_data:ro
-    command: ["python", "/app/scripts/validate_output.py"]
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - nifi_content_repo:/opt/nifi/nifi-current/content_repository
+      - nifi_provenance_repo:/opt/nifi/nifi-current/provenance_repository
+      - nifi_database_repo:/opt/nifi/nifi-current/database_repository
+      - nifi_flowfile_repo:/opt/nifi/nifi-current/flowfile_repository
+      - ./data/source:/opt/nifi/source_data:ro
+      - ./data/output:/opt/nifi/output_data
+      - ./schemas:/opt/nifi/schemas:ro
+    networks:
+      - xclarity_net
+    healthcheck:
+      test: ["CMD", "curl", "-kf", "https://localhost:8443/nifi"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  nifi-registry:
+    image: apache/nifi-registry:1.25.0
+    container_name: xclarity_nifi_registry
+    ports:
+      - "18080:18080"
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - nifi_registry_conf:/opt/nifi-registry/nifi-registry-current/conf
+      - nifi_registry_db:/opt/nifi-registry/nifi-registry-current/database
+      - nifi_registry_flow:/opt/nifi-registry/nifi-registry-current/flow_storage
+    networks:
+      - xclarity_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18080/nifi-registry"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    container_name: xclarity_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: xclarity
+      POSTGRES_PASSWORD: xclarity_pass
+      POSTGRES_DB: xclarity_etl
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - xclarity_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xclarity -d xclarity_etl"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  python-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xclarity_runner
+    depends_on:
+      nifi:
+        condition: service_healthy
+      nifi-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      NIFI_BASE_URL: "https://nifi:8443/nifi-api"
+      NIFI_USERNAME: admin
+      NIFI_PASSWORD: adminpassword123
+      NIFI_VERIFY_SSL: "false"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: xclarity_etl
+      POSTGRES_USER: xclarity
+      POSTGRES_PASSWORD: xclarity_pass
+      SOURCE_DATA_PATH: /opt/nifi/source_data
+      OUTPUT_DATA_PATH: /opt/nifi/output_data
+    volumes:
+      - ./data/source:/opt/nifi/source_data:ro
+      - ./data/output:/opt/nifi/output_data
+      - ./schemas:/opt/nifi/schemas
+      - ./src:/app/src
+      - ./main.py:/app/main.py
+    networks:
+      - xclarity_net
+    command: ["python", "/app/main.py"]
+
+volumes:
+  nifi_conf:
+  nifi_content_repo:
+  nifi_provenance_repo:
+  nifi_database_repo:
+  nifi_flowfile_repo:
+  nifi_registry_conf:
+  nifi_registry_db:
+  nifi_registry_flow:
+  postgres_data:
+
+networks:
+  xclarity_net:
+    driver: bridge
